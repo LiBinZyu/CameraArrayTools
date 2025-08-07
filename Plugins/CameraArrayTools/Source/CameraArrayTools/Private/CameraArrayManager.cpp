@@ -47,6 +47,103 @@ void ACameraArrayManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Super::EndPlay(EndPlayReason);
 }
 
+#if WITH_EDITOR
+void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    if (bIsTaskRunning) return; // 渲染时禁止修改，防止冲突
+
+    const FName PropertyName = (PropertyChangedEvent.Property != nullptr)
+        ? PropertyChangedEvent.Property->GetFName()
+        : NAME_None;
+
+    if (PropertyName == NAME_None) return;
+
+    // --- 按需更新，将破坏性操作降到最低 ---
+
+    // 1. 只有相机数量改变时，才执行完全重建
+    if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, NumCameras))
+    {
+        CreateOrUpdateCameras();
+    }
+    // 2. 只更新位置，保留手动调整过的旋转
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, TotalYDistance) ||
+             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, StartLocation))
+    {
+        for (int32 i = 0; i < ManagedCameras.Num(); ++i)
+        {
+            if (AActor* Camera = ManagedCameras[i])
+            {
+                const FRotator CurrentRotation = Camera->GetActorRotation(); // 保存当前旋转
+                const FVector NewLocation = GetCameraTransform(i).GetLocation(); // 计算新位置
+                Camera->SetActorLocationAndRotation(NewLocation, CurrentRotation, false, nullptr, ETeleportType::None);
+            }
+        }
+    }
+    // 3. 只更新旋转，保留手动调整过的位置
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, SharedRotation) ||
+             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, bUseLookAtTarget) ||
+             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, LookAtTarget))
+    {
+        for (int32 i = 0; i < ManagedCameras.Num(); ++i)
+        {
+            if (AActor* Camera = ManagedCameras[i])
+            {
+                const FVector CurrentLocation = Camera->GetActorLocation(); // 保存当前位置
+                const FRotator NewRotation = GetCameraTransform(i).GetRotation().Rotator(); // 计算新旋转
+                Camera->SetActorLocationAndRotation(CurrentLocation, NewRotation, false, nullptr, ETeleportType::None);
+            }
+        }
+    }
+    // 4. 只更新相机命名和文件夹路径
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraNamePrefix))
+    {
+        const FName FolderName = FName(TEXT("CameraArray"));
+        for (int32 i = 0; i < ManagedCameras.Num(); ++i)
+        {
+            if (AActor* Camera = ManagedCameras[i])
+            {
+                const FString NewLabel = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, i);
+                Camera->SetActorLabel(NewLabel); // 更新Actor在编辑器中的名字
+                Camera->SetFolderPath(FolderName); // 更新文件夹
+            }
+        }
+    }
+    // 5. 只更新FOV
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraFOV))
+    {
+        for (AActor* Camera : ManagedCameras)
+        {
+            if (Camera)
+            {
+                if (UCineCameraComponent* CineCamComponent = Camera->FindComponentByClass<UCineCameraComponent>())
+                {
+                    CineCamComponent->SetFieldOfView(CameraFOV);
+                }
+            }
+        }
+    }
+    // 6. 只更新Filmback的宽高比
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetX) ||
+             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetY))
+    {
+        if (RenderTargetY > 0 && RenderTargetX > 0)
+        {
+            const float DesiredAspectRatio = static_cast<float>(RenderTargetX) / static_cast<float>(RenderTargetY);
+            for (AActor* Camera : ManagedCameras)
+            {
+                if (UCineCameraComponent* CineCamComponent = Camera->FindComponentByClass<UCineCameraComponent>())
+                {
+                    // 保持宽度，根据宽高比调整高度
+                    CineCamComponent->Filmback.SensorHeight = CineCamComponent->Filmback.SensorWidth / DesiredAspectRatio;
+                }
+            }
+        }
+    }
+}
+#endif
+
 void ACameraArrayManager::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
@@ -87,8 +184,6 @@ void ACameraArrayManager::InitializeCaptureComponents()
     ReusableCaptureComponent->TextureTarget = ReusableRenderTarget;
 }
 
-// *** FIX: Re-adding the previously omitted function definitions ***
-
 void ACameraArrayManager::CreateOrUpdateCameras()
 {
     ClearAllCameras();
@@ -120,6 +215,12 @@ void ACameraArrayManager::CreateOrUpdateCameras()
             if (CineCamComponent)
             {
                 CineCamComponent->SetFieldOfView(CameraFOV);
+
+                if (RenderTargetY > 0 && RenderTargetX > 0)
+                {
+                    const float DesiredAspectRatio = static_cast<float>(RenderTargetX) / static_cast<float>(RenderTargetY);
+                    CineCamComponent->Filmback.SensorHeight = CineCamComponent->Filmback.SensorWidth / DesiredAspectRatio;
+                }
             }
 
             FString CameraLabel = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, i);
@@ -158,6 +259,9 @@ void ACameraArrayManager::ClearAllCameras()
     {
         if (IsValid(Camera)) 
         {
+#if WITH_EDITOR
+            Camera->SetFolderPath(NAME_None);
+#endif
             World->DestroyActor(Camera);
             DestroyedCount++;
         }
@@ -174,9 +278,9 @@ void ACameraArrayManager::RenderAllViews()
         UE_LOG(LogTemp, Warning, TEXT("RenderAllViews: 另一个渲染任务已在进行中。"));
         return;
     }
-    if (NumCameras <= 0)
+    if (ManagedCameras.Num() <= 0) // 检查ManagedCameras数组而不是NumCameras属性
     {
-        UE_LOG(LogTemp, Warning, TEXT("RenderAllViews: 相机数量为0。"));
+        UE_LOG(LogTemp, Warning, TEXT("RenderAllViews: 场景中没有可渲染的相机。"));
         return;
     }
 
@@ -193,7 +297,7 @@ void ACameraArrayManager::RenderAllViews()
 
 void ACameraArrayManager::PerformSingleCapture()
 {
-    if (CurrentRenderIndex >= NumCameras)
+    if (CurrentRenderIndex >= ManagedCameras.Num()) // 检查是否超出数组范围
     {
         UE_LOG(LogTemp, Log, TEXT("渲染流程完成!"));
         GetWorld()->GetTimerManager().ClearTimer(RenderTimerHandle);
@@ -210,14 +314,39 @@ void ACameraArrayManager::PerformSingleCapture()
         bIsTaskRunning = false;
         return;
     }
+    
+    // <--- 修改开始: 核心修改，从场景相机读取实时参数用于渲染
+    AActor* CameraActor = ManagedCameras[CurrentRenderIndex];
+    if (!IsValid(CameraActor))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("跳过无效的相机索引 %d"), CurrentRenderIndex);
+        CurrentRenderIndex++;
+        PerformSingleCapture(); // 立即尝试渲染下一个
+        return;
+    }
 
-    RenderProgress = FMath::RoundHalfFromZero((float)CurrentRenderIndex / NumCameras * 100);
-    RenderStatus = FString::Printf(TEXT("渲染中... (%d/%d)"), CurrentRenderIndex + 1, NumCameras);
-    UE_LOG(LogTemp, Log, TEXT("开始渲染相机索引 %d"), CurrentRenderIndex);
+    const UCineCameraComponent* CineCamComponent = CameraActor->FindComponentByClass<UCineCameraComponent>();
+    if (!CineCamComponent)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("相机 %s 没有CineCameraComponent，跳过。"), *CameraActor->GetName());
+        CurrentRenderIndex++;
+        PerformSingleCapture(); // 立即尝试渲染下一个
+        return;
+    }
 
-    const FTransform CameraTransform = GetCameraTransform(CurrentRenderIndex);
+    // 1. 获取相机在场景中的实时Transform
+    const FTransform CameraTransform = CameraActor->GetActorTransform();
+    // 2. 获取相机在场景中的实时FOV
+    const float CameraRealFOV = CineCamComponent->FieldOfView;
+    
+    RenderProgress = FMath::RoundHalfFromZero((float)CurrentRenderIndex / ManagedCameras.Num() * 100);
+    RenderStatus = FString::Printf(TEXT("渲染中... (%d/%d)"), CurrentRenderIndex + 1, ManagedCameras.Num());
+    UE_LOG(LogTemp, Log, TEXT("开始渲染相机 %s"), *CameraActor->GetName());
+
+    // 3. 将实时参数应用到渲染组件
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
-    ReusableCaptureComponent->FOVAngle = CameraFOV;
+    ReusableCaptureComponent->FOVAngle = CameraRealFOV;
+    // <--- 修改结束
     
     ReusableCaptureComponent->CaptureScene();
 
@@ -252,7 +381,7 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
     const int32 Height = ReusableRenderTarget->SizeY;
     const ECameraArrayImageFormat ImageFormatToSave = FileFormat;
 
-    TArray<FColor> RawPixels;
+    TArray <FColor> RawPixels;
     FTextureRenderTargetResource* RenderTargetResource = 
     ReusableRenderTarget->GameThread_GetRenderTargetResource();
 
@@ -261,6 +390,8 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
         UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: 从RenderTarget读取像素失败。"));
         return;
     }
+    
+    RenderTargetResource->ReadPixels(RawPixels);
     
     AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}]()
     {
@@ -310,8 +441,8 @@ FTransform ACameraArrayManager::GetCameraTransform(int32 CameraIndex) const
     FVector Location = StartLocation;
     if (NumCameras > 1)
     {
-        const float TotalDistanceCenti = TotalYDistance * 100.0f;
-        const float Spacing = (NumCameras > 1) ? (TotalDistanceCenti / (NumCameras - 1)) : 0.0f;
+        // 如果只有一个相机，间距为0，避免除以0
+        const float Spacing = (NumCameras > 1) ? (TotalYDistance * 100.0f / (NumCameras - 1)) : 0.0f;
         Location.Y += CameraIndex * Spacing;
     }
 
@@ -377,7 +508,7 @@ void ACameraArrayManager::OrganizeCamerasInFolder()
     {
         if (IsValid(Camera))
         {
-            Camera->SetFolderPath(FName(*FString::Printf(TEXT("CameraArray/%s"), *CameraNamePrefix)));
+            Camera->SetFolderPath(FName(TEXT("CameraArray")));
         }
     }
 #endif
@@ -386,7 +517,7 @@ void ACameraArrayManager::OrganizeCamerasInFolder()
 void ACameraArrayManager::RenderFirstCamera()
 {
     if (bIsTaskRunning) return;
-    if (NumCameras <= 0) return;
+    if (ManagedCameras.Num() <= 0) return;
     
     bIsTaskRunning = true;
     InitializeCaptureComponents();
@@ -397,11 +528,11 @@ void ACameraArrayManager::RenderFirstCamera()
 void ACameraArrayManager::RenderLastCamera()
 {
     if (bIsTaskRunning) return;
-    if (NumCameras <= 0) return;
+    if (ManagedCameras.Num() <= 0) return;
     
     bIsTaskRunning = true;
     InitializeCaptureComponents();
-    const int32 LastCameraIndex = NumCameras - 1;
+    const int32 LastCameraIndex = ManagedCameras.Num() - 1;
     PerformSingleCaptureForSpecificIndex(LastCameraIndex);
     OpenOutputFolder();
 }
@@ -429,13 +560,34 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
         bIsTaskRunning = false;
         return;
     }
+
+    if (!ManagedCameras.IsValidIndex(IndexToCapture) || !IsValid(ManagedCameras[IndexToCapture]))
+    {
+        UE_LOG(LogTemp, Error, TEXT("PerformSingleCaptureForSpecificIndex: 要渲染的相机索引 %d 无效!"), IndexToCapture);
+        bIsTaskRunning = false;
+        return;
+    }
+    
+    // <--- 修改开始: 同样，从场景相机读取实时参数
+    AActor* CameraActor = ManagedCameras[IndexToCapture];
+    const UCineCameraComponent* CineCamComponent = CameraActor->FindComponentByClass<UCineCameraComponent>();
+
+    if (!CineCamComponent)
+    {
+        UE_LOG(LogTemp, Error, TEXT("相机 %s 没有CineCameraComponent，无法渲染。"), *CameraActor->GetName());
+        bIsTaskRunning = false;
+        return;
+    }
+
+    const FTransform CameraTransform = CameraActor->GetActorTransform();
+    const float CameraRealFOV = CineCamComponent->FieldOfView;
     
     RenderProgress = 50;
-    RenderStatus = FString::Printf(TEXT("渲染中... (相机 %d)"), IndexToCapture + 1);
+    RenderStatus = FString::Printf(TEXT("渲染中... (相机 %s)"), *CameraActor->GetName());
 
-    const FTransform CameraTransform = GetCameraTransform(IndexToCapture);
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
-    ReusableCaptureComponent->FOVAngle = CameraFOV;
+    ReusableCaptureComponent->FOVAngle = CameraRealFOV;
+    // <--- 修改结束
 
     ReusableCaptureComponent->CaptureScene();
 
@@ -444,7 +596,12 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
     
     SaveRenderTargetToFileAsync(FullOutputPath, FileName);
 
-    RenderProgress = 100;
-    RenderStatus = TEXT("渲染完成 (文件后台保存中)");
-    bIsTaskRunning = false;
+    // 异步任务在后台保存，我们可以认为渲染指令已完成
+    FTimerHandle TempHandle;
+    GetWorld()->GetTimerManager().SetTimer(TempHandle, [this]()
+    {
+        RenderProgress = 100;
+        RenderStatus = TEXT("渲染完成 (文件后台保存中)");
+        bIsTaskRunning = false;
+    }, 0.5f, false);
 }

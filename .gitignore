@@ -5,6 +5,7 @@ Saved/
 Build/
 Plugins/CameraArrayTools/Binaries/
 Plugins/CameraArrayTools/Intermediate/
+Content/PhotoR_Backgrounds/
 .git/
 *.sln
 *.suo

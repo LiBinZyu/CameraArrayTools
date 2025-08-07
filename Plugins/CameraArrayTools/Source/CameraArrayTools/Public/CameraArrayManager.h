@@ -25,7 +25,11 @@ class CAMERAARRAYTOOLS_API ACameraArrayManager : public AActor
 
 public:
     ACameraArrayManager();
-
+    
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+    
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override; // Cleanup
