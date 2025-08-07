@@ -6,6 +6,11 @@ Build/
 Plugins/CameraArrayTools/Binaries/
 Plugins/CameraArrayTools/Intermediate/
 Content/PhotoR_Backgrounds/
+Content/Collections/
+Content/Developers/
+Content/PhotoR_Backgrounds/
+Content/NewTextureRenderTarget2D.uasset/
+Content/NewTextureRenderTarget2D_Tex.uasset/
 .git/
 *.sln
 *.suo

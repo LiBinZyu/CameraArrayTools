@@ -3,7 +3,6 @@
 #include "CineCameraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/TextureRenderTarget2D.h"
-#include "Kismet/KismetRenderingLibrary.h"
 #include "Engine/World.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -16,6 +15,7 @@
 #include "Modules/ModuleManager.h"
 #include "TimerManager.h"
 #include "TextureResource.h"
+#include "Engine/PostProcessVolume.h"
 #if WITH_EDITOR
 #include "Editor.h"
 #include "Selection.h"
@@ -39,10 +39,12 @@ void ACameraArrayManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
         ReusableCaptureComponent->DestroyComponent();
         ReusableCaptureComponent = nullptr;
     }
-    if (ReusableRenderTarget)
+    if (ReusableHdrRenderTarget||ReusableLdrRenderTarget)
     {
-        ReusableRenderTarget->MarkAsGarbage();
-        ReusableRenderTarget = nullptr;
+        ReusableHdrRenderTarget->MarkAsGarbage();
+        ReusableLdrRenderTarget->MarkAsGarbage();
+        ReusableHdrRenderTarget = nullptr;
+        ReusableLdrRenderTarget = nullptr;
     }
     Super::EndPlay(EndPlayReason);
 }
@@ -54,22 +56,20 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
 
     if (bIsTaskRunning) return; // 渲染时禁止修改，防止冲突
 
-    const FName PropertyName = (PropertyChangedEvent.Property != nullptr)
-        ? PropertyChangedEvent.Property->GetFName()
+    const FName MemberPropertyName = (PropertyChangedEvent.Property != nullptr)
+        ? PropertyChangedEvent.MemberProperty->GetFName()
         : NAME_None;
 
-    if (PropertyName == NAME_None) return;
+    if (MemberPropertyName == NAME_None) return;
 
-    // --- 按需更新，将破坏性操作降到最低 ---
-
-    // 1. 只有相机数量改变时，才执行完全重建
-    if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, NumCameras))
+    // 只有相机数量改变时，才执行完全重建
+    if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, NumCameras))
     {
         CreateOrUpdateCameras();
     }
-    // 2. 只更新位置，保留手动调整过的旋转
-    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, TotalYDistance) ||
-             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, StartLocation))
+    // 只更新位置，保留手动调整过的旋转
+    else if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, TotalYDistance) ||
+             MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, StartLocation))
     {
         for (int32 i = 0; i < ManagedCameras.Num(); ++i)
         {
@@ -81,10 +81,10 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
             }
         }
     }
-    // 3. 只更新旋转，保留手动调整过的位置
-    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, SharedRotation) ||
-             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, bUseLookAtTarget) ||
-             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, LookAtTarget))
+    // 只更新旋转，保留手动调整过的位置
+    else if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, SharedRotation) ||
+             MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, bUseLookAtTarget) ||
+             MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, LookAtTarget))
     {
         for (int32 i = 0; i < ManagedCameras.Num(); ++i)
         {
@@ -96,8 +96,8 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
             }
         }
     }
-    // 4. 只更新相机命名和文件夹路径
-    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraNamePrefix))
+    // 只更新相机命名和文件夹路径
+    else if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraNamePrefix))
     {
         const FName FolderName = FName(TEXT("CameraArray"));
         for (int32 i = 0; i < ManagedCameras.Num(); ++i)
@@ -110,8 +110,8 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
             }
         }
     }
-    // 5. 只更新FOV
-    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraFOV))
+    // 只更新FOV
+    else if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, CameraFOV))
     {
         for (AActor* Camera : ManagedCameras)
         {
@@ -124,9 +124,9 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
             }
         }
     }
-    // 6. 只更新Filmback的宽高比
-    else if (PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetX) ||
-             PropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetY))
+    // 只更新Filmback的宽高比
+    else if (MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetX) ||
+             MemberPropertyName == GET_MEMBER_NAME_CHECKED(ACameraArrayManager, RenderTargetY))
     {
         if (RenderTargetY > 0 && RenderTargetX > 0)
         {
@@ -142,6 +142,40 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
         }
     }
 }
+
+void ACameraArrayManager::SyncShowFlagsWithEditorViewport()
+{
+    if (GEditor && ReusableCaptureComponent)
+    {
+        FViewport* ActiveViewport = GEditor->GetActiveViewport();
+        if (ActiveViewport)
+        {
+            FEditorViewportClient* ViewportClient = (FEditorViewportClient*)ActiveViewport->GetClient();
+            if (ViewportClient)
+            {
+                ReusableCaptureComponent->ShowFlags = ViewportClient->EngineShowFlags;
+                UE_LOG(LogTemp, Log, TEXT("成功将截图组件的ShowFlags与编辑器视口同步。"));
+            }
+        }
+    }
+}
+void ACameraArrayManager::SyncPostProcessSettings()
+{
+    if (IsValid(ReusableCaptureComponent))
+    {
+        if (IsValid(PostProcessVolumeRef))
+        {
+            ReusableCaptureComponent->PostProcessSettings = PostProcessVolumeRef->Settings;
+            ReusableCaptureComponent->PostProcessBlendWeight = PostProcessVolumeRef->BlendWeight;
+            UE_LOG(LogTemp, Log, TEXT("成功从 %s 同步后期处理设置。"), *PostProcessVolumeRef->GetName());
+        }
+        else
+        {
+            ReusableCaptureComponent->PostProcessSettings = FPostProcessSettings();
+            ReusableCaptureComponent->PostProcessBlendWeight = 0.0f; // 权重为0等于没效果
+        }
+    }
+}
 #endif
 
 void ACameraArrayManager::Tick(float DeltaTime)
@@ -154,34 +188,32 @@ void ACameraArrayManager::InitializeCaptureComponents()
     if (!IsValid(ReusableCaptureComponent))
     {
         ReusableCaptureComponent = NewObject<USceneCaptureComponent2D>(this, TEXT("ReusableCaptureComponent"));
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
         ReusableCaptureComponent->bCaptureEveryFrame = false;
         ReusableCaptureComponent->bCaptureOnMovement = false;
-        
-        ReusableCaptureComponent->ShowFlags.SetAtmosphere(true);
-        ReusableCaptureComponent->ShowFlags.SetBSP(true);
-        ReusableCaptureComponent->ShowFlags.SetSkeletalMeshes(true);
-        ReusableCaptureComponent->ShowFlags.SetStaticMeshes(true);
-        ReusableCaptureComponent->ShowFlags.SetLighting(true);
-        ReusableCaptureComponent->ShowFlags.SetSkyLighting(true);
-        ReusableCaptureComponent->ShowFlags.SetParticles(true);
-        ReusableCaptureComponent->ShowFlags.SetTranslucency(true);
-        ReusableCaptureComponent->ShowFlags.SetAntiAliasing(true);
-        
         ReusableCaptureComponent->RegisterComponentWithWorld(GetWorld());
     }
 
-    if (!IsValid(ReusableRenderTarget) || ReusableRenderTarget->SizeX != RenderTargetX || ReusableRenderTarget->SizeY != RenderTargetY)
+    // --- LDR Render Target (for PNG, JPG, BMP, TGA) ---
+    if (!IsValid(ReusableLdrRenderTarget) || ReusableLdrRenderTarget->SizeX != RenderTargetX || ReusableLdrRenderTarget->SizeY != RenderTargetY)
     {
-        ReusableRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableRenderTarget"));
-        ReusableRenderTarget->RenderTargetFormat = RTF_RGBA8_SRGB;
-        ReusableRenderTarget->SizeX = RenderTargetX;
-        ReusableRenderTarget->SizeY = RenderTargetY;
-        ReusableRenderTarget->InitAutoFormat(RenderTargetX, RenderTargetY);
-        ReusableRenderTarget->UpdateResource();
+        ReusableLdrRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableLdrRenderTarget"));
+        ReusableLdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8_SRGB;
+        ReusableLdrRenderTarget->SizeX = RenderTargetX;
+        ReusableLdrRenderTarget->SizeY = RenderTargetY;
+        ReusableLdrRenderTarget->bAutoGenerateMips = false;
+        ReusableLdrRenderTarget->UpdateResource();
     }
 
-    ReusableCaptureComponent->TextureTarget = ReusableRenderTarget;
+    // --- HDR Render Target (for EXR, TIFF, HDR) ---
+    if (!IsValid(ReusableHdrRenderTarget) || ReusableHdrRenderTarget->SizeX != RenderTargetX || ReusableHdrRenderTarget->SizeY != RenderTargetY)
+    {
+        ReusableHdrRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableHdrRenderTarget"));
+        ReusableHdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA16f;
+        ReusableHdrRenderTarget->SizeX = RenderTargetX;
+        ReusableHdrRenderTarget->SizeY = RenderTargetY;
+        ReusableHdrRenderTarget->bAutoGenerateMips = false;
+        ReusableHdrRenderTarget->UpdateResource();
+    }
 }
 
 void ACameraArrayManager::CreateOrUpdateCameras()
@@ -278,15 +310,31 @@ void ACameraArrayManager::RenderAllViews()
         UE_LOG(LogTemp, Warning, TEXT("RenderAllViews: 另一个渲染任务已在进行中。"));
         return;
     }
-    if (ManagedCameras.Num() <= 0) // 检查ManagedCameras数组而不是NumCameras属性
+    if (ManagedCameras.Num() <= 0)
     {
         UE_LOG(LogTemp, Warning, TEXT("RenderAllViews: 场景中没有可渲染的相机。"));
         return;
     }
 
+#if WITH_EDITOR
+    SyncShowFlagsWithEditorViewport();
+    SyncPostProcessSettings();
+#endif
+    
     bIsTaskRunning = true;
     InitializeCaptureComponents(); 
     
+    if (IsHdrFormat())
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
+    }
+    else
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+    }
+
     GetWorld()->GetTimerManager().ClearTimer(RenderTimerHandle);
     CurrentRenderIndex = 0;
     RenderProgress = 0;
@@ -307,15 +355,6 @@ void ACameraArrayManager::PerformSingleCapture()
         return;
     }
     
-    if (!GetWorld() || !IsValid(ReusableCaptureComponent) || !IsValid(ReusableRenderTarget))
-    {
-        UE_LOG(LogTemp, Error, TEXT("PerformSingleCapture: World或渲染组件无效!"));
-        RenderStatus = TEXT("渲染失败: 内部组件错误");
-        bIsTaskRunning = false;
-        return;
-    }
-    
-    // <--- 修改开始: 核心修改，从场景相机读取实时参数用于渲染
     AActor* CameraActor = ManagedCameras[CurrentRenderIndex];
     if (!IsValid(CameraActor))
     {
@@ -333,27 +372,23 @@ void ACameraArrayManager::PerformSingleCapture()
         PerformSingleCapture(); // 立即尝试渲染下一个
         return;
     }
-
-    // 1. 获取相机在场景中的实时Transform
+    
     const FTransform CameraTransform = CameraActor->GetActorTransform();
-    // 2. 获取相机在场景中的实时FOV
     const float CameraRealFOV = CineCamComponent->FieldOfView;
     
     RenderProgress = FMath::RoundHalfFromZero((float)CurrentRenderIndex / ManagedCameras.Num() * 100);
     RenderStatus = FString::Printf(TEXT("渲染中... (%d/%d)"), CurrentRenderIndex + 1, ManagedCameras.Num());
     UE_LOG(LogTemp, Log, TEXT("开始渲染相机 %s"), *CameraActor->GetName());
-
-    // 3. 将实时参数应用到渲染组件
+    
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
     ReusableCaptureComponent->FOVAngle = CameraRealFOV;
-    // <--- 修改结束
     
     ReusableCaptureComponent->CaptureScene();
 
     const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
     const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, CurrentRenderIndex, *GetFileExtension());
     
-    SaveRenderTargetToFileAsync(FullOutputPath, FileName);
+    SaveRenderTargetToFileAsync(FullOutputPath, FileName, ReusableCaptureComponent->TextureTarget);
     
     CurrentRenderIndex++;
     
@@ -362,11 +397,11 @@ void ACameraArrayManager::PerformSingleCapture()
     GetWorld()->GetTimerManager().SetTimer(RenderTimerHandle, TimerDel, 0.02f, false);
 }
 
-void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName)
+void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave)
 {
-    if (!IsValid(ReusableRenderTarget))
+    if (!IsValid(RenderTargetToSave))
     {
-        UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: 可复用的RenderTarget无效。"));
+        UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: Invalid RenderTargetToSave"));
         return;
     }
     
@@ -377,52 +412,129 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
     }
 
     const FString FilePath = FullOutputPath / FileName;
-    const int32 Width = ReusableRenderTarget->SizeX;
-    const int32 Height = ReusableRenderTarget->SizeY;
+    const int32 Width = RenderTargetToSave->SizeX;
+    const int32 Height = RenderTargetToSave->SizeY;
     const ECameraArrayImageFormat ImageFormatToSave = FileFormat;
 
-    TArray <FColor> RawPixels;
-    FTextureRenderTargetResource* RenderTargetResource = 
-    ReusableRenderTarget->GameThread_GetRenderTargetResource();
+    // --- 捕获Gamma校正参数 ---
+    const bool bApplyGamma = this->bEnableLdrGammaCorrection;
+    const float Gamma = this->LdrGammaValue;
 
-    if (!RenderTargetResource || !RenderTargetResource->ReadPixels(RawPixels))
-    {
-        UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: 从RenderTarget读取像素失败。"));
-        return;
-    }
-    
-    RenderTargetResource->ReadPixels(RawPixels);
-    
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}]()
-    {
-        IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-        
-        ::EImageFormat EngineImageFormat;
-        switch (ImageFormatToSave)
-        {
-            case ECameraArrayImageFormat::JPEG: EngineImageFormat = ::EImageFormat::JPEG; break;
-            case ECameraArrayImageFormat::BMP:  EngineImageFormat = ::EImageFormat::BMP; break;
-            case ECameraArrayImageFormat::PNG:
-            default:                            EngineImageFormat = ::EImageFormat::PNG; break;
-        }
+    const bool bIsHdr = (RenderTargetToSave->RenderTargetFormat == RTF_RGBA16f);
 
-        TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
-        if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(RawPixels.GetData(), RawPixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+    if (bIsHdr)
+    {
+        // --- HDR SAVING LOGIC ---
+        TArray<FLinearColor> RawPixels;
+        FTextureRenderTargetResource* RenderTargetResource = RenderTargetToSave->GameThread_GetRenderTargetResource();
+        if (!RenderTargetResource || !RenderTargetResource->ReadLinearColorPixels(RawPixels))
         {
-            UE_LOG(LogTemp, Error, TEXT("为 %s 编码图像数据失败。"), *FilePath);
+            UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync (HDR): 从RenderTarget读取像素失败。"));
             return;
         }
 
-        const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
-        if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}]()
         {
-            UE_LOG(LogTemp, Log, TEXT("成功异步保存图像到: %s"), *FilePath);
-        }
-        else
+            TArray<FLinearColor> PixelsToSave = RawPixels;
+            // Force alpha to 1.0 (opaque) for all HDR formats
+            for (FLinearColor& Pixel : PixelsToSave)
+            {
+                Pixel.A = 1.0f;
+            }
+
+            IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+            EImageFormat EngineImageFormat;
+            switch (ImageFormatToSave)
+            {
+                case ECameraArrayImageFormat::EXR: EngineImageFormat = EImageFormat::EXR; break;
+                default: UE_LOG(LogTemp, Error, TEXT("Invalid HDR format specified.")); return;
+            }
+
+            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
+            if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(PixelsToSave.GetData(), PixelsToSave.Num() * sizeof(FLinearColor), Width, Height, ERGBFormat::RGBAF, 32))
+            {
+                UE_LOG(LogTemp, Error, TEXT("为 %s 编码HDR图像数据失败。"), *FilePath);
+                return;
+            }
+            
+            const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+            if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+            {
+                UE_LOG(LogTemp, Log, TEXT("成功异步保存HDR图像到: %s"), *FilePath);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Error, TEXT("保存HDR图像文件失败: %s"), *FilePath);
+            }
+        });
+    }
+    else
+    {
+        // --- LDR SAVING LOGIC ---
+        TArray<FColor> RawPixels;
+        FTextureRenderTargetResource* RenderTargetResource = RenderTargetToSave->GameThread_GetRenderTargetResource();
+        if (!RenderTargetResource || !RenderTargetResource->ReadPixels(RawPixels))
         {
-            UE_LOG(LogTemp, Error, TEXT("保存图像文件失败: %s"), *FilePath);
+            UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync (LDR): 从RenderTarget读取像素失败。"));
+            return;
         }
-    });
+        
+        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}, bApplyGamma, Gamma]()
+        {
+            TArray<FColor> PixelsToSave = RawPixels;
+            if (bApplyGamma && Gamma > 0.0f && !FMath::IsNearlyEqual(Gamma, 1.0f))
+            {
+                const float InvGamma = 1.0f / Gamma;
+                for (FColor& Pixel : PixelsToSave)
+                {
+                    Pixel.R = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.R / 255.f, InvGamma) * 255.f), 0, 255);
+                    Pixel.G = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.G / 255.f, InvGamma) * 255.f), 0, 255);
+                    Pixel.B = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.B / 255.f, InvGamma) * 255.f), 0, 255);
+                }
+                UE_LOG(LogTemp, Log, TEXT("已对图像 %s 应用Gamma校正，Gamma值为: %.2f"), *FilePath, Gamma);
+            }
+
+            // 强制所有LDR格式的Alpha通道为255（不透明）
+            for (FColor& Pixel : PixelsToSave)
+            {
+                Pixel.A = 255;
+            }
+
+            IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+            EImageFormat EngineImageFormat;
+            switch (ImageFormatToSave)
+            {
+                case ECameraArrayImageFormat::JPEG: EngineImageFormat = EImageFormat::JPEG; break;
+                case ECameraArrayImageFormat::BMP:  EngineImageFormat = EImageFormat::BMP; break;
+                case ECameraArrayImageFormat::TGA:  EngineImageFormat = EImageFormat::TGA; break;
+                case ECameraArrayImageFormat::PNG:
+                default:                            EngineImageFormat = EImageFormat::PNG; break;
+            }
+
+            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
+            if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(PixelsToSave.GetData(), PixelsToSave.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+            {
+                UE_LOG(LogTemp, Error, TEXT("为 %s 编码LDR图像数据失败。"), *FilePath);
+                return;
+            }
+            const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+            if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+            {
+                UE_LOG(LogTemp, Log, TEXT("成功异步保存LDR图像到: %s"), *FilePath);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Error, TEXT("保存LDR图像文件失败: %s"), *FilePath);
+            }
+        });
+    }
+}
+
+bool ACameraArrayManager::IsHdrFormat() const
+{
+    return FileFormat == ECameraArrayImageFormat::EXR/* || 
+           FileFormat == ECameraArrayImageFormat::TIFF || 
+           FileFormat == ECameraArrayImageFormat::HDR*/;
 }
 
 FString ACameraArrayManager::GetFileExtension() const
@@ -432,6 +544,10 @@ FString ACameraArrayManager::GetFileExtension() const
     case ECameraArrayImageFormat::PNG: return TEXT("png");
     case ECameraArrayImageFormat::JPEG: return TEXT("jpg");
     case ECameraArrayImageFormat::BMP: return TEXT("bmp");
+    case ECameraArrayImageFormat::TGA: return TEXT("tga");
+    case ECameraArrayImageFormat::EXR: return TEXT("exr");
+    //case ECameraArrayImageFormat::TIFF: return TEXT("tiff");
+    //case ECameraArrayImageFormat::HDR: return TEXT("hdr");
     default: return TEXT("png");
     }
 }
@@ -455,6 +571,32 @@ FTransform ACameraArrayManager::GetCameraTransform(int32 CameraIndex) const
     }
     
     return FTransform(Rotation, Location);
+}
+
+void ACameraArrayManager::RenderFirstCamera()
+{
+    if (bIsTaskRunning) return;
+    if (ManagedCameras.Num() <= 0) return;
+#if WITH_EDITOR
+    SyncShowFlagsWithEditorViewport();
+    SyncPostProcessSettings();
+#endif
+    bIsTaskRunning = true;
+    InitializeCaptureComponents();
+    
+    if (IsHdrFormat())
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
+    }
+    else
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+    }
+
+    PerformSingleCaptureForSpecificIndex(0);
+    OpenOutputFolder();
 }
 
 void ACameraArrayManager::SelectFirstCamera()
@@ -514,26 +656,29 @@ void ACameraArrayManager::OrganizeCamerasInFolder()
 #endif
 }
 
-void ACameraArrayManager::RenderFirstCamera()
-{
-    if (bIsTaskRunning) return;
-    if (ManagedCameras.Num() <= 0) return;
-    
-    bIsTaskRunning = true;
-    InitializeCaptureComponents();
-    PerformSingleCaptureForSpecificIndex(0);
-    OpenOutputFolder();
-}
-
 void ACameraArrayManager::RenderLastCamera()
 {
     if (bIsTaskRunning) return;
     if (ManagedCameras.Num() <= 0) return;
-    
+#if WITH_EDITOR
+    SyncShowFlagsWithEditorViewport();
+    SyncPostProcessSettings();
+#endif
     bIsTaskRunning = true;
     InitializeCaptureComponents();
-    const int32 LastCameraIndex = ManagedCameras.Num() - 1;
-    PerformSingleCaptureForSpecificIndex(LastCameraIndex);
+    
+    if (IsHdrFormat())
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
+    }
+    else
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+    }
+
+    PerformSingleCaptureForSpecificIndex(ManagedCameras.Num() - 1);
     OpenOutputFolder();
 }
 
@@ -553,7 +698,8 @@ void ACameraArrayManager::OpenOutputFolder()
 
 void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapture)
 {
-    if (!GetWorld() || !IsValid(ReusableCaptureComponent) || !IsValid(ReusableRenderTarget))
+    // A single, robust check for the essential components.
+    if (!GetWorld() || !IsValid(ReusableCaptureComponent) || !IsValid(ReusableLdrRenderTarget) || !IsValid(ReusableHdrRenderTarget))
     {
         UE_LOG(LogTemp, Error, TEXT("PerformSingleCaptureForSpecificIndex: World或渲染组件无效!"));
         RenderStatus = TEXT("渲染失败: 内部组件错误");
@@ -568,7 +714,6 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
         return;
     }
     
-    // <--- 修改开始: 同样，从场景相机读取实时参数
     AActor* CameraActor = ManagedCameras[IndexToCapture];
     const UCineCameraComponent* CineCamComponent = CameraActor->FindComponentByClass<UCineCameraComponent>();
 
@@ -577,6 +722,17 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
         UE_LOG(LogTemp, Error, TEXT("相机 %s 没有CineCameraComponent，无法渲染。"), *CameraActor->GetName());
         bIsTaskRunning = false;
         return;
+    }
+    
+    if (IsHdrFormat())
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
+    }
+    else
+    {
+        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
+        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
     }
 
     const FTransform CameraTransform = CameraActor->GetActorTransform();
@@ -587,21 +743,19 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
 
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
     ReusableCaptureComponent->FOVAngle = CameraRealFOV;
-    // <--- 修改结束
 
     ReusableCaptureComponent->CaptureScene();
 
     const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
     const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, IndexToCapture, *GetFileExtension());
     
-    SaveRenderTargetToFileAsync(FullOutputPath, FileName);
-
-    // 异步任务在后台保存，我们可以认为渲染指令已完成
+    SaveRenderTargetToFileAsync(FullOutputPath, FileName, ReusableCaptureComponent->TextureTarget);
+    
     FTimerHandle TempHandle;
     GetWorld()->GetTimerManager().SetTimer(TempHandle, [this]()
     {
         RenderProgress = 100;
         RenderStatus = TEXT("渲染完成 (文件后台保存中)");
         bIsTaskRunning = false;
-    }, 0.5f, false);
+    }, 0.02f, false);
 }

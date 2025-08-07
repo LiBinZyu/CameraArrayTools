@@ -9,14 +9,22 @@
 
 class USceneCaptureComponent2D; // Forward declaration
 class UTextureRenderTarget2D;
+class APostProcessVolume;
 
 UENUM(BlueprintType)
 enum class ECameraArrayImageFormat : uint8
 {
-    PNG UMETA(DisplayName = "PNG"),
-    JPEG UMETA(DisplayName = "JPEG"),
-    BMP UMETA(DisplayName = "BMP")
+    PNG UMETA(DisplayName = "PNG (8-bit)"),
+    JPEG UMETA(DisplayName = "JPEG (8-bit)"),
+    BMP UMETA(DisplayName = "BMP (8-bit)"),
+    TGA UMETA(DisplayName = "TGA (8-bit)"),
+    
+    // High Bit-Depth Formats
+    EXR UMETA(DisplayName = "EXR (16-bit Float)"),
+    //TIFF UMETA(DisplayName = "TIFF (16-bit)"),
+    //HDR UMETA(DisplayName = "HDR (Radiance)")
 };
+
 
 UCLASS()
 class CAMERAARRAYTOOLS_API ACameraArrayManager : public AActor
@@ -60,7 +68,7 @@ public:
 
     // 是否启用LookAtTarget功能
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Look At Target", meta = (DisplayName = "启用LookAtTarget"))
-    bool bUseLookAtTarget = true;
+    bool bUseLookAtTarget = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Look At Target", meta = (DisplayName = "场景目标点"))
     TObjectPtr<AActor> LookAtTarget;
@@ -82,6 +90,15 @@ public:
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "相机前缀"))
     FString CameraNamePrefix = TEXT("Camera");
+    
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "后处理引用"))
+    TObjectPtr<APostProcessVolume> PostProcessVolumeRef;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "启用LDR Gamma校正"))
+    bool bEnableLdrGammaCorrection = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "LDR Gamma值", EditCondition = "bEnableLdrGammaCorrection", ClampMin = "0.1", UIMin = "0.1", UIMax = "5.0"))
+    float LdrGammaValue = 2.2f;
     
     UPROPERTY(VisibleAnywhere, Category = "[READONLY]", meta = (DisplayName = "渲染进度", UIMin = "0", UIMax = "100", Delta = "1"))
     int32 RenderProgress = 0;
@@ -117,27 +134,35 @@ public:
 private:
     UPROPERTY()
     TArray<TObjectPtr<AActor>> ManagedCameras;
-
-    // *** OPTIMIZATION: Reusable capture components ***
+    
     UPROPERTY()
     TObjectPtr<USceneCaptureComponent2D> ReusableCaptureComponent;
     
     UPROPERTY()
-    TObjectPtr<UTextureRenderTarget2D> ReusableRenderTarget;
-
-    // Helper to create and setup reusable components
+    TObjectPtr<UTextureRenderTarget2D> ReusableLdrRenderTarget; // LDR
+    
+    UPROPERTY()
+    TObjectPtr<UTextureRenderTarget2D> ReusableHdrRenderTarget; // HDR
+    
     void InitializeCaptureComponents();
     
     bool bIsTaskRunning = false;
     FTransform GetCameraTransform(int32 CameraIndex) const;
     int32 CurrentRenderIndex;
     FTimerHandle RenderTimerHandle;
+    bool IsHdrFormat() const;
     
     void PerformSingleCapture();
     void PerformSingleCaptureForSpecificIndex(int32 IndexToCapture);
     
-    void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName);
-    
+    //void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName);
+    void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave);
+
     FString GetFileExtension() const;
     void OrganizeCamerasInFolder();
+
+#if WITH_EDITOR
+    void SyncShowFlagsWithEditorViewport();
+    void SyncPostProcessSettings();
+#endif
 };
