@@ -66,11 +66,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "相机FOV"))
     float CameraFOV = 50.0f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Others", meta = (DisplayName = "后处理引用"))
+    TObjectPtr<APostProcessVolume> PostProcessVolumeRef;
+    
     // 是否启用LookAtTarget功能
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Look At Target", meta = (DisplayName = "启用LookAtTarget"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Others", meta = (DisplayName = "启用LookAtTarget"))
     bool bUseLookAtTarget = false;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Look At Target", meta = (DisplayName = "场景目标点"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Others", meta = (DisplayName = "场景目标点"))
     TObjectPtr<AActor> LookAtTarget;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "输出宽度"))
@@ -90,15 +93,6 @@ public:
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "相机前缀"))
     FString CameraNamePrefix = TEXT("Camera");
-    
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "后处理引用"))
-    TObjectPtr<APostProcessVolume> PostProcessVolumeRef;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "启用LDR Gamma校正"))
-    bool bEnableLdrGammaCorrection = true;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "LDR Gamma值", EditCondition = "bEnableLdrGammaCorrection", ClampMin = "0.1", UIMin = "0.1", UIMax = "5.0"))
-    float LdrGammaValue = 2.2f;
     
     UPROPERTY(VisibleAnywhere, Category = "[READONLY]", meta = (DisplayName = "渲染进度", UIMin = "0", UIMax = "100", Delta = "1"))
     int32 RenderProgress = 0;

@@ -41,7 +41,8 @@ public class CameraArrayTools : ModuleRules
 				"SlateCore",
 				"Renderer",
 				"ImageWrapper",
-                //"RHI",
+                "RHI",
+                "RenderCore",
                 //"UnrealEd",
 				// ... add private dependencies that you statically link with here ...	
 			}

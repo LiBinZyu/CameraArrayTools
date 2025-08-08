@@ -6,7 +6,6 @@
 #include "Engine/World.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
-#include "UObject/ConstructorHelpers.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformFileManager.h"
 #include "Async/Async.h"
@@ -16,6 +15,10 @@
 #include "TimerManager.h"
 #include "TextureResource.h"
 #include "Engine/PostProcessVolume.h"
+#include "RHICommandList.h"
+#include "RHIResources.h"
+#include "RenderCore.h"
+#include "RenderingThread.h"
 #if WITH_EDITOR
 #include "Editor.h"
 #include "Selection.h"
@@ -190,6 +193,8 @@ void ACameraArrayManager::InitializeCaptureComponents()
         ReusableCaptureComponent = NewObject<USceneCaptureComponent2D>(this, TEXT("ReusableCaptureComponent"));
         ReusableCaptureComponent->bCaptureEveryFrame = false;
         ReusableCaptureComponent->bCaptureOnMovement = false;
+        ReusableCaptureComponent->bAlwaysPersistRenderingState = true;
+        ReusableCaptureComponent->bUseRayTracingIfEnabled = true;
         ReusableCaptureComponent->RegisterComponentWithWorld(GetWorld());
     }
 
@@ -197,7 +202,7 @@ void ACameraArrayManager::InitializeCaptureComponents()
     if (!IsValid(ReusableLdrRenderTarget) || ReusableLdrRenderTarget->SizeX != RenderTargetX || ReusableLdrRenderTarget->SizeY != RenderTargetY)
     {
         ReusableLdrRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableLdrRenderTarget"));
-        ReusableLdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8_SRGB;
+        ReusableLdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
         ReusableLdrRenderTarget->SizeX = RenderTargetX;
         ReusableLdrRenderTarget->SizeY = RenderTargetY;
         ReusableLdrRenderTarget->bAutoGenerateMips = false;
@@ -324,16 +329,9 @@ void ACameraArrayManager::RenderAllViews()
     bIsTaskRunning = true;
     InitializeCaptureComponents(); 
     
-    if (IsHdrFormat())
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
-    }
-    else
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
-    }
+
+    ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+    ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
 
     GetWorld()->GetTimerManager().ClearTimer(RenderTimerHandle);
     CurrentRenderIndex = 0;
@@ -382,6 +380,16 @@ void ACameraArrayManager::PerformSingleCapture()
     
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
     ReusableCaptureComponent->FOVAngle = CameraRealFOV;
+
+    // Hide all managed cameras from the capture
+    ReusableCaptureComponent->HiddenActors.Empty();
+    for (AActor* Cam : ManagedCameras)
+    {
+        if (IsValid(Cam))
+        {
+            ReusableCaptureComponent->HiddenActors.Add(Cam);
+        }
+    }
     
     ReusableCaptureComponent->CaptureScene();
 
@@ -394,7 +402,7 @@ void ACameraArrayManager::PerformSingleCapture()
     
     FTimerDelegate TimerDel;
     TimerDel.BindUObject(this, &ACameraArrayManager::PerformSingleCapture);
-    GetWorld()->GetTimerManager().SetTimer(RenderTimerHandle, TimerDel, 0.02f, false);
+    GetWorld()->GetTimerManager().SetTimerForNextTick(TimerDel);
 }
 
 void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave)
@@ -404,7 +412,7 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
         UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: Invalid RenderTargetToSave"));
         return;
     }
-    
+
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
     if (!PlatformFile.DirectoryExists(*FullOutputPath))
     {
@@ -415,119 +423,128 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
     const int32 Width = RenderTargetToSave->SizeX;
     const int32 Height = RenderTargetToSave->SizeY;
     const ECameraArrayImageFormat ImageFormatToSave = FileFormat;
+    const bool bSaveAsHdr = IsHdrFormat();
 
-    // --- 捕获Gamma校正参数 ---
-    const bool bApplyGamma = this->bEnableLdrGammaCorrection;
-    const float Gamma = this->LdrGammaValue;
-
-    const bool bIsHdr = (RenderTargetToSave->RenderTargetFormat == RTF_RGBA16f);
-
-    if (bIsHdr)
+    // 获取底层 RHI 纹理（必须在渲染线程访问）
+    FTextureRenderTargetResource* RTResource = RenderTargetToSave->GameThread_GetRenderTargetResource();
+    if (!RTResource)
     {
-        // --- HDR SAVING LOGIC ---
-        TArray<FLinearColor> RawPixels;
-        FTextureRenderTargetResource* RenderTargetResource = RenderTargetToSave->GameThread_GetRenderTargetResource();
-        if (!RenderTargetResource || !RenderTargetResource->ReadLinearColorPixels(RawPixels))
+        UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync: 无法获取 RenderTarget 资源"));
+        return;
+    }
+
+    // 将读取操作放到渲染线程执行（不会阻塞 Game Thread）
+    ENQUEUE_RENDER_COMMAND(FCaptureAndReadbackCommand)(
+        [RTTexture = RTResource->GetRenderTargetTexture(), Width, Height, FilePath, ImageFormatToSave, bSaveAsHdr](FRHICommandListImmediate& RHICmdList)
         {
-            UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync (HDR): 从RenderTarget读取像素失败。"));
-            return;
-        }
-
-        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}]()
-        {
-            TArray<FLinearColor> PixelsToSave = RawPixels;
-            // Force alpha to 1.0 (opaque) for all HDR formats
-            for (FLinearColor& Pixel : PixelsToSave)
+            if (!RTTexture)
             {
-                Pixel.A = 1.0f;
-            }
-
-            IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-            EImageFormat EngineImageFormat;
-            switch (ImageFormatToSave)
-            {
-                case ECameraArrayImageFormat::EXR: EngineImageFormat = EImageFormat::EXR; break;
-                default: UE_LOG(LogTemp, Error, TEXT("Invalid HDR format specified.")); return;
-            }
-
-            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
-            if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(PixelsToSave.GetData(), PixelsToSave.Num() * sizeof(FLinearColor), Width, Height, ERGBFormat::RGBAF, 32))
-            {
-                UE_LOG(LogTemp, Error, TEXT("为 %s 编码HDR图像数据失败。"), *FilePath);
+                UE_LOG(LogTemp, Error, TEXT("FCaptureAndReadbackCommand: RTTexture为空"));
                 return;
             }
-            
-            const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
-            if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+
+            // 要读取的矩形
+            FIntRect Rect(0, 0, Width, Height);
+
+            // 读取 LDR（FColor） 或 HDR（FLinearColor） 数据到临时容器
+            if (bSaveAsHdr)
             {
-                UE_LOG(LogTemp, Log, TEXT("成功异步保存HDR图像到: %s"), *FilePath);
-            }
-            else
-            {
-                UE_LOG(LogTemp, Error, TEXT("保存HDR图像文件失败: %s"), *FilePath);
-            }
-        });
-    }
-    else
-    {
-        // --- LDR SAVING LOGIC ---
-        TArray<FColor> RawPixels;
-        FTextureRenderTargetResource* RenderTargetResource = RenderTargetToSave->GameThread_GetRenderTargetResource();
-        if (!RenderTargetResource || !RenderTargetResource->ReadPixels(RawPixels))
-        {
-            UE_LOG(LogTemp, Error, TEXT("SaveRenderTargetToFileAsync (LDR): 从RenderTarget读取像素失败。"));
-            return;
-        }
-        
-        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Width, Height, FilePath, ImageFormatToSave, RawPixels{MoveTemp(RawPixels)}, bApplyGamma, Gamma]()
-        {
-            TArray<FColor> PixelsToSave = RawPixels;
-            if (bApplyGamma && Gamma > 0.0f && !FMath::IsNearlyEqual(Gamma, 1.0f))
-            {
-                const float InvGamma = 1.0f / Gamma;
-                for (FColor& Pixel : PixelsToSave)
+                TArray<FFloat16Color> Float16Pixels;
+                FReadSurfaceDataFlags ReadFlags;
+                ReadFlags.SetLinearToGamma(false);
+
+                // 从RHI读取表面数据到Float16Pixels数组
+                RHICmdList.ReadSurfaceFloatData(RTTexture, Rect, Float16Pixels, ReadFlags);
+                
+                TArray<FLinearColor> LinearPixels;
+                LinearPixels.SetNumUninitialized(Float16Pixels.Num());
+                for (int32 i = 0; i < Float16Pixels.Num(); ++i)
                 {
-                    Pixel.R = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.R / 255.f, InvGamma) * 255.f), 0, 255);
-                    Pixel.G = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.G / 255.f, InvGamma) * 255.f), 0, 255);
-                    Pixel.B = FMath::Clamp(FMath::RoundToInt(FMath::Pow(Pixel.B / 255.f, InvGamma) * 255.f), 0, 255);
+                    LinearPixels[i] = FLinearColor(Float16Pixels[i]);
                 }
-                UE_LOG(LogTemp, Log, TEXT("已对图像 %s 应用Gamma校正，Gamma值为: %.2f"), *FilePath, Gamma);
-            }
 
-            // 强制所有LDR格式的Alpha通道为255（不透明）
-            for (FColor& Pixel : PixelsToSave)
-            {
-                Pixel.A = 255;
-            }
+                // 把转换后的线性像素交给后台线程进行编码和保存
+                TArray<FLinearColor> PixelsToSave = MoveTemp(LinearPixels);
+                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PixelsToSave = MoveTemp(PixelsToSave), FilePath, Width, Height, ImageFormatToSave]() mutable
+                {
+                    // 强制 alpha = 1
+                    TArray<FLinearColor> Local = MoveTemp(PixelsToSave);
+                    for (FLinearColor& P : Local) P.A = 1.0f;
 
-            IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-            EImageFormat EngineImageFormat;
-            switch (ImageFormatToSave)
-            {
-                case ECameraArrayImageFormat::JPEG: EngineImageFormat = EImageFormat::JPEG; break;
-                case ECameraArrayImageFormat::BMP:  EngineImageFormat = EImageFormat::BMP; break;
-                case ECameraArrayImageFormat::TGA:  EngineImageFormat = EImageFormat::TGA; break;
-                case ECameraArrayImageFormat::PNG:
-                default:                            EngineImageFormat = EImageFormat::PNG; break;
-            }
+                    IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+                    EImageFormat EngineImageFormat;
+                    switch (ImageFormatToSave)
+                    {
+                        case ECameraArrayImageFormat::EXR: EngineImageFormat = EImageFormat::EXR; break;
+                        default: UE_LOG(LogTemp, Error, TEXT("HDR: 不支持的格式")); return;
+                    }
 
-            TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
-            if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(PixelsToSave.GetData(), PixelsToSave.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
-            {
-                UE_LOG(LogTemp, Error, TEXT("为 %s 编码LDR图像数据失败。"), *FilePath);
-                return;
-            }
-            const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
-            if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
-            {
-                UE_LOG(LogTemp, Log, TEXT("成功异步保存LDR图像到: %s"), *FilePath);
+                    TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
+                    if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw((const void*)Local.GetData(), Local.Num() * sizeof(FLinearColor), Width, Height, ERGBFormat::RGBAF, 32))
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("为 %s 编码HDR图像数据失败。"), *FilePath);
+                        return;
+                    }
+
+                    const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+                    if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+                    {
+                        UE_LOG(LogTemp, Log, TEXT("成功异步保存HDR图像到: %s"), *FilePath);
+                    }
+                    else
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("保存HDR图像文件失败: %s"), *FilePath);
+                    }
+                });
             }
             else
             {
-                UE_LOG(LogTemp, Error, TEXT("保存LDR图像文件失败: %s"), *FilePath);
+                // LDR: 读取为 FColor（引擎会在渲染线程做 linear->gamma/tonemap）
+                TArray<FColor> OutData;
+                FReadSurfaceDataFlags ReadFlags;
+                ReadFlags.SetLinearToGamma(true); // 请求引擎在读取时做线性->sRGB转换
+
+                // 从 RHI 读取表面数据到 OutData（在渲染线程）
+                RHICmdList.ReadSurfaceData(RTTexture, Rect, OutData, ReadFlags);
+
+                // 将像素数组交给后台线程进行编码与文件写入
+                TArray<FColor> PixelsToSave = MoveTemp(OutData);
+                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PixelsToSave = MoveTemp(PixelsToSave), FilePath, ImageFormatToSave, Width, Height]() mutable
+                {
+                    TArray<FColor> Local = MoveTemp(PixelsToSave);
+                    for (FColor& P : Local) P.A = 255;
+
+                    IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+                    EImageFormat EngineImageFormat;
+                    switch (ImageFormatToSave)
+                    {
+                        case ECameraArrayImageFormat::JPEG: EngineImageFormat = EImageFormat::JPEG; break;
+                        case ECameraArrayImageFormat::BMP:  EngineImageFormat = EImageFormat::BMP; break;
+                        case ECameraArrayImageFormat::TGA:  EngineImageFormat = EImageFormat::TGA; break;
+                        case ECameraArrayImageFormat::PNG:
+                        default:                            EngineImageFormat = EImageFormat::PNG; break;
+                    }
+
+                    TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EngineImageFormat);
+                    if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw((const void*)Local.GetData(), Local.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("为 %s 编码LDR图像数据失败。"), *FilePath);
+                        return;
+                    }
+
+                    const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+                    if (FFileHelper::SaveArrayToFile(CompressedData, *FilePath))
+                    {
+                        UE_LOG(LogTemp, Log, TEXT("成功异步保存LDR图像到: %s"), *FilePath);
+                    }
+                    else
+                    {
+                        UE_LOG(LogTemp, Error, TEXT("保存LDR图像文件失败: %s"), *FilePath);
+                    }
+                });
             }
-        });
-    }
+        }
+    ); // ENQUEUE_RENDER_COMMAND
 }
 
 bool ACameraArrayManager::IsHdrFormat() const
@@ -583,17 +600,6 @@ void ACameraArrayManager::RenderFirstCamera()
 #endif
     bIsTaskRunning = true;
     InitializeCaptureComponents();
-    
-    if (IsHdrFormat())
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
-    }
-    else
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
-    }
 
     PerformSingleCaptureForSpecificIndex(0);
     OpenOutputFolder();
@@ -666,17 +672,6 @@ void ACameraArrayManager::RenderLastCamera()
 #endif
     bIsTaskRunning = true;
     InitializeCaptureComponents();
-    
-    if (IsHdrFormat())
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
-    }
-    else
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
-    }
 
     PerformSingleCaptureForSpecificIndex(ManagedCameras.Num() - 1);
     OpenOutputFolder();
@@ -724,16 +719,8 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
         return;
     }
     
-    if (IsHdrFormat())
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorHDR;
-    }
-    else
-    {
-        ReusableCaptureComponent->TextureTarget = ReusableLdrRenderTarget;
-        ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
-    }
+    ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
+    ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
 
     const FTransform CameraTransform = CameraActor->GetActorTransform();
     const float CameraRealFOV = CineCamComponent->FieldOfView;
@@ -743,6 +730,16 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
 
     ReusableCaptureComponent->SetWorldTransform(CameraTransform);
     ReusableCaptureComponent->FOVAngle = CameraRealFOV;
+
+    // Hide all managed cameras from the capture
+    ReusableCaptureComponent->HiddenActors.Empty();
+    for (AActor* Cam : ManagedCameras)
+    {
+        if (IsValid(Cam))
+        {
+            ReusableCaptureComponent->HiddenActors.Add(Cam);
+        }
+    }
 
     ReusableCaptureComponent->CaptureScene();
 
