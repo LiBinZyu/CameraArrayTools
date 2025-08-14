@@ -7,6 +7,7 @@
 #include "Engine/EngineTypes.h"
 #include "CameraArrayManager.generated.h"
 
+
 class USceneCaptureComponent2D; // Forward declaration
 class UTextureRenderTarget2D;
 class APostProcessVolume;
@@ -93,6 +94,9 @@ public:
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "相机前缀"))
     FString CameraNamePrefix = TEXT("Camera");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", meta = (DisplayName = "路径追踪渲染时间 (秒)"))
+    float PathTracingRenderTime = 3.0f;
     
     UPROPERTY(VisibleAnywhere, Category = "[READONLY]", meta = (DisplayName = "渲染进度", UIMin = "0", UIMax = "100", Delta = "1"))
     int32 RenderProgress = 0;
@@ -113,17 +117,23 @@ public:
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "选择最后一个相机"))
     void SelectLastCamera();
 
-    UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染第一个相机"))
+    /*UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染第一个相机"))
     void RenderFirstCamera();
 
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染最后一个相机"))
     void RenderLastCamera();
 
     UFUNCTION(BlueprintCallable,CallInEditor, Category = "批处理", meta = (DisplayName = "渲染到图片"))
-    void RenderAllViews();
+    void RenderAllViews();*/
 
+    // 打开输出文件夹
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "批处理", meta = (DisplayName = "打开输出文件夹"))
     void OpenOutputFolder();
+
+    // 渲染所有相机视角
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "批处理", meta = (DisplayName = "为所有相机拍摄高清截图"))
+    void TakeHighResScreenshots();
+
 
 private:
     UPROPERTY()
@@ -146,17 +156,24 @@ private:
     FTimerHandle RenderTimerHandle;
     bool IsHdrFormat() const;
     
-    void PerformSingleCapture();
+    /*void PerformSingleCapture();
     void PerformSingleCaptureForSpecificIndex(int32 IndexToCapture);
     
     //void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName);
-    void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave);
+    void SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave);*/
 
     FString GetFileExtension() const;
     void OrganizeCamerasInFolder();
 
+    int32 CurrentScreenshotIndex;
+    FTimerHandle ScreenshotTimerHandle;
+    FTimerHandle PathTracingLogTimerHandle;
+
 #if WITH_EDITOR
     void SyncShowFlagsWithEditorViewport();
     void SyncPostProcessSettings();
+    void TakeNextHighResScreenshot();
+    float GetPathTracingProgress(int32& CurrentSPP, int32& TotalSPP);
+    void LogPathTracingProgress();
 #endif
 };

@@ -22,6 +22,10 @@
 #if WITH_EDITOR
 #include "Editor.h"
 #include "Selection.h"
+#include "SEditorViewport.h"
+#include "SceneView.h"
+#include "SceneManagement.h"
+#include "HighResScreenshot.h"
 #endif
 
 ACameraArrayManager::ACameraArrayManager()
@@ -42,11 +46,14 @@ void ACameraArrayManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
         ReusableCaptureComponent->DestroyComponent();
         ReusableCaptureComponent = nullptr;
     }
-    if (ReusableHdrRenderTarget||ReusableLdrRenderTarget)
+    if (ReusableHdrRenderTarget)
     {
         ReusableHdrRenderTarget->MarkAsGarbage();
-        ReusableLdrRenderTarget->MarkAsGarbage();
         ReusableHdrRenderTarget = nullptr;
+    }
+    if (ReusableLdrRenderTarget)
+    {
+        ReusableLdrRenderTarget->MarkAsGarbage();
         ReusableLdrRenderTarget = nullptr;
     }
     Super::EndPlay(EndPlayReason);
@@ -201,6 +208,10 @@ void ACameraArrayManager::InitializeCaptureComponents()
     // --- LDR Render Target (for PNG, JPG, BMP, TGA) ---
     if (!IsValid(ReusableLdrRenderTarget) || ReusableLdrRenderTarget->SizeX != RenderTargetX || ReusableLdrRenderTarget->SizeY != RenderTargetY)
     {
+        if (ReusableLdrRenderTarget)
+        {
+            ReusableLdrRenderTarget->MarkAsGarbage();
+        }
         ReusableLdrRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableLdrRenderTarget"));
         ReusableLdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
         ReusableLdrRenderTarget->SizeX = RenderTargetX;
@@ -212,6 +223,10 @@ void ACameraArrayManager::InitializeCaptureComponents()
     // --- HDR Render Target (for EXR, TIFF, HDR) ---
     if (!IsValid(ReusableHdrRenderTarget) || ReusableHdrRenderTarget->SizeX != RenderTargetX || ReusableHdrRenderTarget->SizeY != RenderTargetY)
     {
+        if (ReusableHdrRenderTarget)
+        {
+            ReusableHdrRenderTarget->MarkAsGarbage();
+        }
         ReusableHdrRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("ReusableHdrRenderTarget"));
         ReusableHdrRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA16f;
         ReusableHdrRenderTarget->SizeX = RenderTargetX;
@@ -308,7 +323,7 @@ void ACameraArrayManager::ClearAllCameras()
     UE_LOG(LogTemp, Log, TEXT("ClearAllCameras: 成功销毁了 %d 个相机。"), DestroyedCount);
 }
 
-void ACameraArrayManager::RenderAllViews()
+/*void ACameraArrayManager::RenderAllViews()
 {
     if (bIsTaskRunning)
     {
@@ -328,7 +343,7 @@ void ACameraArrayManager::RenderAllViews()
     
     bIsTaskRunning = true;
     InitializeCaptureComponents(); 
-    
+
 
     ReusableCaptureComponent->TextureTarget = ReusableHdrRenderTarget;
     ReusableCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
@@ -391,18 +406,64 @@ void ACameraArrayManager::PerformSingleCapture()
         }
     }
     
-    ReusableCaptureComponent->CaptureScene();
+    // 检查ShowFlags中是否启用了路径追踪
+    const bool bIsPathTracing = ReusableCaptureComponent->ShowFlags.PathTracing;
 
-    const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
-    const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, CurrentRenderIndex, *GetFileExtension());
-    
-    SaveRenderTargetToFileAsync(FullOutputPath, FileName, ReusableCaptureComponent->TextureTarget);
-    
-    CurrentRenderIndex++;
-    
-    FTimerDelegate TimerDel;
-    TimerDel.BindUObject(this, &ACameraArrayManager::PerformSingleCapture);
-    GetWorld()->GetTimerManager().SetTimerForNextTick(TimerDel);
+    if (bIsPathTracing && PathTracingRenderTime > 0.0f)
+    {
+        // 路径追踪需要时间来累积采样
+        UE_LOG(LogTemp, Log, TEXT("已启用路径追踪。相机 %s 将进行 %.2f 秒的累积采样。"), *CameraActor->GetName(), PathTracingRenderTime);
+
+        // 启用每帧捕获以进行累积
+        ReusableCaptureComponent->bCaptureEveryFrame = true;
+
+        const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
+        const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, CurrentRenderIndex, *GetFileExtension());
+        UTextureRenderTarget2D* RenderTargetToSave = ReusableCaptureComponent->TextureTarget;
+
+        // 设置一个计时器，在延迟后停止捕获并继续下一步
+        FTimerHandle AccumulationTimerHandle;
+        FTimerDelegate TimerDelegate;
+        TimerDelegate.BindLambda([this, FullOutputPath, FileName, RenderTargetToSave, CameraName = CameraActor->GetName()]()
+        {
+            if (IsValid(ReusableCaptureComponent))
+            {
+                // 停止连续捕获
+                ReusableCaptureComponent->bCaptureEveryFrame = false;
+                ReusableCaptureComponent-> bAlwaysPersistRenderingState = false;
+            }
+
+            UE_LOG(LogTemp, Log, TEXT("相机 %s 的累积采样已完成，正在保存图像。"), *CameraName);
+            SaveRenderTargetToFileAsync(FullOutputPath, FileName, RenderTargetToSave);
+
+            // 移动到下一个相机
+            CurrentRenderIndex++;
+            
+            // 调度下一次捕获。使用SetTimerForNextTick以避免深度递归。
+            FTimerDelegate NextCaptureDel;
+            NextCaptureDel.BindUObject(this, &ACameraArrayManager::PerformSingleCapture);
+            GetWorld()->GetTimerManager().SetTimerForNextTick(NextCaptureDel);
+        });
+
+        GetWorld()->GetTimerManager().SetTimer(AccumulationTimerHandle, TimerDelegate, PathTracingRenderTime, false);
+    }
+    else
+    {
+        // 针对非路径追踪（或零延迟）的标准捕获
+        ReusableCaptureComponent->CaptureScene();
+
+        const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
+        const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, CurrentRenderIndex, *GetFileExtension());
+        
+        SaveRenderTargetToFileAsync(FullOutputPath, FileName, ReusableCaptureComponent->TextureTarget);
+        
+        CurrentRenderIndex++;
+        
+        // 在下一Tick调度下一次捕-
+        FTimerDelegate TimerDel;
+        TimerDel.BindUObject(this, &ACameraArrayManager::PerformSingleCapture);
+        GetWorld()->GetTimerManager().SetTimerForNextTick(TimerDel);
+    }
 }
 
 void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputPath, const FString& FileName, UTextureRenderTarget2D* RenderTargetToSave)
@@ -545,7 +606,7 @@ void ACameraArrayManager::SaveRenderTargetToFileAsync(const FString& FullOutputP
             }
         }
     ); // ENQUEUE_RENDER_COMMAND
-}
+}*/
 
 bool ACameraArrayManager::IsHdrFormat() const
 {
@@ -569,6 +630,20 @@ FString ACameraArrayManager::GetFileExtension() const
     }
 }
 
+void ACameraArrayManager::OpenOutputFolder()
+{
+    const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
+    
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (!PlatformFile.DirectoryExists(*FullOutputPath))
+    {
+        PlatformFile.CreateDirectoryTree(*FullOutputPath);
+    }
+    
+    FPlatformProcess::ExploreFolder(*FullOutputPath);
+    UE_LOG(LogTemp, Log, TEXT("已打开输出文件夹: %s"), *FullOutputPath);
+}
+
 FTransform ACameraArrayManager::GetCameraTransform(int32 CameraIndex) const
 {
     FVector Location = StartLocation;
@@ -588,21 +663,6 @@ FTransform ACameraArrayManager::GetCameraTransform(int32 CameraIndex) const
     }
     
     return FTransform(Rotation, Location);
-}
-
-void ACameraArrayManager::RenderFirstCamera()
-{
-    if (bIsTaskRunning) return;
-    if (ManagedCameras.Num() <= 0) return;
-#if WITH_EDITOR
-    SyncShowFlagsWithEditorViewport();
-    SyncPostProcessSettings();
-#endif
-    bIsTaskRunning = true;
-    InitializeCaptureComponents();
-
-    PerformSingleCaptureForSpecificIndex(0);
-    OpenOutputFolder();
 }
 
 void ACameraArrayManager::SelectFirstCamera()
@@ -662,6 +722,21 @@ void ACameraArrayManager::OrganizeCamerasInFolder()
 #endif
 }
 
+/*void ACameraArrayManager::RenderFirstCamera()
+{
+    if (bIsTaskRunning) return;
+    if (ManagedCameras.Num() <= 0) return;
+#if WITH_EDITOR
+    SyncShowFlagsWithEditorViewport();
+    SyncPostProcessSettings();
+#endif
+    bIsTaskRunning = true;
+    InitializeCaptureComponents();
+
+    PerformSingleCaptureForSpecificIndex(0);
+    OpenOutputFolder();
+}
+
 void ACameraArrayManager::RenderLastCamera()
 {
     if (bIsTaskRunning) return;
@@ -675,20 +750,6 @@ void ACameraArrayManager::RenderLastCamera()
 
     PerformSingleCaptureForSpecificIndex(ManagedCameras.Num() - 1);
     OpenOutputFolder();
-}
-
-void ACameraArrayManager::OpenOutputFolder()
-{
-    const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
-    
-    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-    if (!PlatformFile.DirectoryExists(*FullOutputPath))
-    {
-        PlatformFile.CreateDirectoryTree(*FullOutputPath);
-    }
-    
-    FPlatformProcess::ExploreFolder(*FullOutputPath);
-    UE_LOG(LogTemp, Log, TEXT("已打开输出文件夹: %s"), *FullOutputPath);
 }
 
 void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapture)
@@ -741,18 +802,307 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
         }
     }
 
-    ReusableCaptureComponent->CaptureScene();
+    const bool bIsPathTracing = ReusableCaptureComponent->ShowFlags.PathTracing;
 
-    const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
-    const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, IndexToCapture, *GetFileExtension());
-    
-    SaveRenderTargetToFileAsync(FullOutputPath, FileName, ReusableCaptureComponent->TextureTarget);
-    
-    FTimerHandle TempHandle;
-    GetWorld()->GetTimerManager().SetTimer(TempHandle, [this]()
+    if (bIsPathTracing && PathTracingRenderTime > 0.0f)
     {
-        RenderProgress = 100;
-        RenderStatus = TEXT("渲染完成 (文件后台保存中)");
-        bIsTaskRunning = false;
-    }, 0.02f, false);
+        // 1. Enable continuous capture.
+        ReusableCaptureComponent->bCaptureEveryFrame = false;
+
+        const FString FullOutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / OutputPath);
+        const FString FileName = FString::Printf(TEXT("%s_%03d.%s"), *CameraNamePrefix, IndexToCapture, *GetFileExtension());
+        UTextureRenderTarget2D* RenderTargetToSave = ReusableCaptureComponent->TextureTarget;
+
+        UE_LOG(LogTemp, Log, TEXT("Starting 2-second accumulation for Path Tracing for camera %s."), *CameraActor->GetName());
+
+        // 2. Set a timer to stop the capture and save the file after a delay.
+        FTimerHandle FinalizeCaptureHandle;
+        FTimerDelegate TimerDelegate;
+        TimerDelegate.BindLambda([this, FullOutputPath, FileName, RenderTargetToSave, CameraName = CameraActor->GetName()]()
+        {
+            // 3. Stop continuous capture.
+            if (IsValid(ReusableCaptureComponent))
+            {
+                ReusableCaptureComponent->bCaptureEveryFrame = false;
+                ReusableCaptureComponent->bAlwaysPersistRenderingState = false;
+            }
+
+            // 4. Save the accumulated result to a file.
+            UE_LOG(LogTemp, Log, TEXT("Accumulation finished for %s. Saving image to %s."), *CameraName, *FullOutputPath);
+            SaveRenderTargetToFileAsync(FullOutputPath, FileName, RenderTargetToSave);
+
+            // 5. Update status and unlock the task runner.
+            RenderProgress = 100;
+            RenderStatus = TEXT("Render complete (file saving in background)");
+            bIsTaskRunning = false;
+        });
+
+        // Hardcoded 2-second delay for path tracing accumulation.
+        GetWorld()->GetTimerManager().SetTimer(FinalizeCaptureHandle, TimerDelegate, PathTracingRenderTime, false);
+    }
+}*/
+
+#if WITH_EDITOR
+void ACameraArrayManager::TakeHighResScreenshots()
+{
+    if (bIsTaskRunning)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TakeHighResScreenshots: A task is already running."));
+        return;
+    }
+    if (ManagedCameras.Num() <= 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TakeHighResScreenshots: No managed cameras to capture."));
+        return;
+    }
+    if (!GEditor)
+    {
+        UE_LOG(LogTemp, Error, TEXT("TakeHighResScreenshots: GEditor is not available."));
+        return;
+    }
+
+    bIsTaskRunning = true;
+    CurrentScreenshotIndex = 0;
+    RenderProgress = 0;
+    RenderStatus = TEXT("开始高清截图...");
+    UE_LOG(LogTemp, Log, TEXT("Starting high-resolution screenshot capture for %d cameras."), ManagedCameras.Num());
+
+    // Start the capture sequence
+    TakeNextHighResScreenshot();
 }
+
+void ACameraArrayManager::TakeNextHighResScreenshot()
+{
+    if (CurrentScreenshotIndex >= ManagedCameras.Num())
+    {
+        UE_LOG(LogTemp, Log, TEXT("High-resolution screenshot process completed."));
+        GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
+        RenderProgress = 100;
+        RenderStatus = TEXT("高清截图完成");
+        bIsTaskRunning = false;
+        return;
+    }
+
+    AActor* CameraActor = ManagedCameras[CurrentScreenshotIndex];
+    if (!IsValid(CameraActor))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Skipping invalid camera at index %d"), CurrentScreenshotIndex);
+        CurrentScreenshotIndex++;
+        
+        FTimerDelegate NextScreenshotDel;
+        NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
+        GetWorld()->GetTimerManager().SetTimerForNextTick(NextScreenshotDel);
+        return;
+    }
+
+    FEditorViewportClient* ViewportClient = (FEditorViewportClient*)GEditor->GetActiveViewport()->GetClient();
+    if (!ViewportClient)
+    {
+        UE_LOG(LogTemp, Error, TEXT("Could not get active editor viewport client. Aborting screenshot task."));
+        RenderStatus = TEXT("错误：找不到视口");
+        bIsTaskRunning = false;
+        return;
+    }
+
+    // --- 定位视口 ---
+    const FTransform CameraTransform = CameraActor->GetActorTransform();
+    ViewportClient->SetViewLocation(CameraTransform.GetLocation());
+    ViewportClient->SetViewRotation(CameraTransform.GetRotation().Rotator());
+    ViewportClient->ViewFOV = CameraFOV;
+    ViewportClient->SetGameView(true);
+    ViewportClient->SetRealtime(true); // 确保视口实时更新以进行累积
+    ViewportClient->ViewportType = LVT_Perspective;
+    
+    ViewportClient->Invalidate(); 
+
+    const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
+    int32 SamplesPerPixel = 1;
+    if (PostProcessVolumeRef)
+    {
+        SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PostProcessVolumeRef is not set. Using default Samples Per Pixel."));
+    }
+
+    if (bIsPathTracing)
+    {
+        const FString CameraLabel = CameraActor->GetActorLabel();
+        UE_LOG(LogTemp, Log, TEXT("Starting Path Tracing accumulation for camera %s. Waiting for samples to complete."), *CameraLabel);
+        RenderStatus = FString::Printf(TEXT("路径追踪... (%d/%d)"), CurrentScreenshotIndex + 1, ManagedCameras.Num());
+        IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
+        
+        GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
+
+        // Create a timer to periodically check the path tracing progress.
+        // The lambda now only captures `this`, which is safe.
+        FTimerDelegate ProgressCheckDelegate;
+        ProgressCheckDelegate.BindLambda([this]()
+        {
+            int32 CurrentSPP, TotalSPP;
+            const float Progress = GetPathTracingProgress(CurrentSPP, TotalSPP);
+            LogPathTracingProgress();
+            
+            // When accumulation is complete, take the screenshot.
+            if (Progress >= 1.0f)
+            {
+                GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
+
+                // Non-blocking: Enqueue a command on the render thread. Once it's processed,
+                // we know the path-traced frame is ready. Then, switch back to the game thread
+                // to safely configure the screenshot and continue the sequence.
+                ENQUEUE_RENDER_COMMAND(FHighResScreenshotRenderCommand)(
+                    [this](FRHICommandListImmediate& RHICmdList)
+                    {
+                        // This command is flushed on the render thread, ensuring all previous commands (like path tracing) are complete.
+                        // Now, schedule the continuation on the game thread.
+                        AsyncTask(ENamedThreads::GameThread, [this]()
+                        {
+                            if (!this || !GetWorld()) return; // Safety check
+
+                            const FString SaveFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CurrentScreenshotIndex);
+                            
+                            FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
+                            if(IsHdrFormat())
+                            {
+                                HRConfig.bCaptureHDR = true;
+                                const FString HdrFilename = SaveFilename + TEXT(".") + GetFileExtension();
+                                HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, HdrFilename);
+                                HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
+                                HRConfig.bDumpBufferVisualizationTargets = false;
+                            }
+                            else
+                            {
+                                HRConfig.bCaptureHDR = false;
+                                const FString LDRFilename = SaveFilename + TEXT(".") + GetFileExtension();
+                                HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, LDRFilename);
+                                HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
+                                HRConfig.bDumpBufferVisualizationTargets = false;
+                            }
+                            
+                            // The screenshot is triggered by the engine's high-res screenshot system, which reads this config.
+                            // We don't need to call FScreenshotRequest::RequestScreenshot explicitly here,
+                            // as the context seems to be driven by an editor process.
+
+                            CurrentScreenshotIndex++;
+
+                            // Schedule the next screenshot for the next tick.
+                            FTimerDelegate NextScreenshotDel;
+                            NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
+                            GetWorld()->GetTimerManager().SetTimerForNextTick(NextScreenshotDel);
+                        });
+                    }
+                );
+            }
+        });
+
+        // Start the looping timer to check progress every half-second.
+        GetWorld()->GetTimerManager().SetTimer(ScreenshotTimerHandle, ProgressCheckDelegate, 0.5f, true);
+    }
+    else
+    {
+        const FString PngFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CurrentScreenshotIndex);
+        RenderStatus = FString::Printf(TEXT("截图中... (%d/%d)"), CurrentScreenshotIndex + 1, ManagedCameras.Num());
+        UE_LOG(LogTemp, Log, TEXT("Capturing standard screenshot for camera %s to %s.png"), *CameraActor->GetActorLabel(), *PngFilename);
+        FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
+        HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
+        HRConfig.SetFilename(PngFilename);
+
+        // 安排下一次截图
+        CurrentScreenshotIndex++;
+        FTimerDelegate NextScreenshotDel;
+        NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
+        GetWorld()->GetTimerManager().SetTimer(ScreenshotTimerHandle, NextScreenshotDel, 0.05f, false);
+    }
+}
+
+float ACameraArrayManager::GetPathTracingProgress(int32& CurrentSPP, int32& TotalSPP)
+{
+    CurrentSPP = 0;
+    TotalSPP = 1;
+
+    // 检查我们是否在编辑器环境中
+    if (!GEditor)
+    {
+        return 0.0f;
+    }
+
+    // 获取当前激活的编辑器视口
+    FViewport* ActiveViewport = GEditor->GetActiveViewport();
+    if (!ActiveViewport)
+    {
+        return 0.0f;
+    }
+
+    // 将 FViewport 转换为 FEditorViewportClient
+    FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(ActiveViewport->GetClient());
+    if (!ViewportClient)
+    {
+        return 0.0f;
+    }
+
+    // 检查当前视口是否是路径追踪模式
+    const bool bIsPathTracing = ViewportClient->GetViewMode() == VMI_PathTracing;
+    if (!bIsPathTracing)
+    {
+        return 0.0f;
+    }
+
+    // 获取视口的世界
+    UWorld* World = ViewportClient->GetWorld();
+    if (!World || !World->Scene)
+    {
+        return 0.0f;
+    }
+
+    // --- 核心逻辑: 创建一个临时的 SceneView 来访问渲染状态 ---
+
+    // 1. 创建一个 ViewFamily
+    FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
+        ViewportClient->Viewport,
+        World->Scene,
+        ViewportClient->EngineShowFlags)
+        .SetRealtimeUpdate(ViewportClient->IsRealtime()));
+
+    // 2. 创建一个 SceneView
+    //    直接调用即可，无需创建 FSceneViewInitOptions
+    FSceneView* View = ViewportClient->CalcSceneView(&ViewFamily);
+
+    if (!View || !View->State)
+    {
+        return 0.0f;
+    }
+
+    // 3. 从 SceneView 的公共接口 FSceneViewStateInterface 中获取数据
+    const FSceneViewStateInterface* ViewState = View->State;
+
+    // 当前采样数 (SPP)
+    // 使用公共接口函数 GetPathTracingSampleIndex()
+    CurrentSPP = ViewState->GetPathTracingSampleIndex();
+
+    // 总采样数 (SPP)
+    // 这个值可以从后期处理设置中安全地获取
+    TotalSPP = View->FinalPostProcessSettings.PathTracingSamplesPerPixel;
+
+    if (TotalSPP > 0)
+    {
+        // 返回进度，范围限制在 0.0 和 1.0 之间
+        return FMath::Clamp(static_cast<float>(CurrentSPP) / static_cast<float>(TotalSPP), 0.0f, 1.0f);
+    }
+
+    return 0.0f;
+}
+void ACameraArrayManager::LogPathTracingProgress()
+{
+    int32 CurrentSPP, TotalSPP;
+    // 调用你现有的函数来获取进度
+    const float Progress = GetPathTracingProgress(CurrentSPP, TotalSPP);
+
+    // 只有在能获取到有效SPP总数时才打印，避免无效日志
+    if (TotalSPP > 0)
+    {
+        UE_LOG(LogTemp, Log, TEXT("路径追踪累积进度: %d / %d 采样 (%.1f%%)"), CurrentSPP, TotalSPP, Progress * 100.0f);
+    }
+}
+#endif
