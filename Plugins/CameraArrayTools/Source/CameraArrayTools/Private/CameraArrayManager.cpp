@@ -210,6 +210,12 @@ void ACameraArrayManager::PostEditChangeProperty(FPropertyChangedEvent& Property
 				const FRotator CurrentRotation = Camera->GetActorRotation(); // 保存当前旋转
 				const FVector NewLocation = GetCameraTransform(i).GetLocation(); // 计算新位置
 				Camera->SetActorLocationAndRotation(NewLocation, CurrentRotation, false, nullptr, ETeleportType::None);
+				if (bUseLookAtTarget)
+				{
+					const FVector CurrentLocation = Camera->GetActorLocation(); // 保存当前位置
+					const FRotator NewRotation = GetCameraTransform(i).GetRotation().Rotator(); // 计算新旋转
+					Camera->SetActorLocationAndRotation(CurrentLocation, NewRotation, false, nullptr, ETeleportType::None);
+				}
 			}
 		}
 	}
@@ -981,7 +987,10 @@ void ACameraArrayManager::PerformSingleCaptureForSpecificIndex(int32 IndexToCapt
     }
 }*/
 
+
 #if WITH_EDITOR
+
+// 入口函数：开始批量截图任务
 void ACameraArrayManager::TakeHighResScreenshots()
 {
 	if (bIsTaskRunning)
@@ -1000,13 +1009,8 @@ void ACameraArrayManager::TakeHighResScreenshots()
 		return;
 	}
 
-	// 在开始新任务前清理所有定时器
 	ClearAllTimers();
-	
-	// 保存原始视口状态
 	SaveOriginalViewportState();
-	
-	// 锁定编辑器属性
 	LockEditorProperties();
 	
 	bIsTaskRunning = true;
@@ -1015,237 +1019,70 @@ void ACameraArrayManager::TakeHighResScreenshots()
 	RenderStatus = TEXT("开始高清截图...");
 	UE_LOG(LogTemp, Log, TEXT("Starting high-resolution screenshot capture for %d cameras."), ManagedCameras.Num());
 
-	// Start the capture sequence
-	TakeNextHighResScreenshot();
+	// 启动递归循环
+	TakeNextHighResScreenshot_Recursive();
 }
 
-void ACameraArrayManager::TakeNextHighResScreenshot()
+// 循环控制器：递归调用，负责驱动整个流程
+void ACameraArrayManager::TakeNextHighResScreenshot_Recursive()
 {
+	// 检查是否所有相机都已处理完毕
 	if (CurrentScreenshotIndex >= ManagedCameras.Num())
 	{
-		GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
+		UE_LOG(LogTemp, Log, TEXT("All screenshot requests submitted. Finalizing..."));
 		
-		FTimerHandle RestoreViewportTimerHandle;
-		FTimerDelegate RestoreDelegate;
-		RestoreDelegate.BindLambda([this]()
+		// 设置一个短暂的最终延时，以确保最后一张截图的文件已成功写入
+		FTimerHandle FinalizeTimerHandle;
+		FTimerDelegate FinalizeDelegate;
+		FinalizeDelegate.BindLambda([this]()
 		{
-			// 这个Lambda函数内的代码将在延时结束后执行
-			UE_LOG(LogTemp, Log, TEXT("Finalizing process and restoring original viewport state."));
 			RenderProgress = 100;
 			RenderStatus = TEXT("完成");
-			bIsTaskRunning = false;
+			UE_LOG(LogTemp, Log, TEXT("Screenshot process finished."));
 			
-			RestoreOriginalViewportState();
 			UnlockEditorProperties();
+			RestoreOriginalViewportState();
+			bIsTaskRunning = false;
 			OpenOutputFolder();
 		});
+		GetWorld()->GetTimerManager().SetTimer(FinalizeTimerHandle, FinalizeDelegate, 1.0f, false);
+		return;
+	}
 
-		// 设置延时确保截图完成
-		GetWorld()->GetTimerManager().SetTimer(RestoreViewportTimerHandle, RestoreDelegate, 3.0f, false);
+	// 为当前索引的相机执行截图，并设置回调函数
+	// 回调函数的内容是：在当前截图完成后，继续处理下一个
+	ExecuteScreenshotForCamera(CurrentScreenshotIndex, [this]()
+	{
+		RenderProgress = FMath::RoundToInt((static_cast<float>(CurrentScreenshotIndex) / ManagedCameras.Num()) * 100.0f);
 		
-		return;
-	}
-
-	AActor* CameraActor = ManagedCameras[CurrentScreenshotIndex];
-	if (!IsValid(CameraActor))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("Skipping invalid camera at index %d"), CurrentScreenshotIndex);
+		// 使用 SetTimerForNextTick 来调用下一次递归，避免堆栈溢出
+		FTimerHandle NextTickTimer;
+		GetWorld()->GetTimerManager().SetTimer(NextTickTimer, this, &ACameraArrayManager::TakeNextHighResScreenshot_Recursive, 0.1f, false);
 		CurrentScreenshotIndex++;
-
-		FTimerDelegate NextScreenshotDel;
-		NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
-		GetWorld()->GetTimerManager().SetTimerForNextTick(NextScreenshotDel);
-		return;
-	}
-
-#if WITH_EDITOR
-	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->
-		GetClient());
-	if (!ViewportClient)
-	{
-		UE_LOG(LogTemp, Error, TEXT("Could not get active editor viewport client. Aborting screenshot task."));
-		RenderStatus = TEXT("错误：找不到视口");
-		bIsTaskRunning = false;
-		return;
-	}
-
-	// --- 定位视口 ---
-	const FTransform CameraTransform = CameraActor->GetActorTransform();
-	ViewportClient->SetViewLocation(CameraTransform.GetLocation());
-	ViewportClient->SetViewRotation(CameraTransform.GetRotation().Rotator());
-	ViewportClient->ViewFOV = CameraFOV;
-	ViewportClient->SetGameView(true);
-	ViewportClient->SetRealtime(true); // 确保视口实时更新以进行累积
-	ViewportClient->ViewportType = LVT_Perspective;
-
-	ViewportClient->Invalidate();
-
-	const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
-#endif
-	int32 SamplesPerPixel = 1;
-	if (PostProcessVolumeRef)
-	{
-		SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("PostProcessVolumeRef is not set. Using default Samples Per Pixel."));
-	}
-
-	if (bIsPathTracing)
-	{
-		const FString CameraLabel = CameraActor->GetActorLabel();
-		UE_LOG(LogTemp, Log, TEXT("Starting Path Tracing accumulation for camera %s. Waiting for samples to complete."),
-		       *CameraLabel);
-		RenderStatus = FString::Printf(TEXT("路径追踪... (%d/%d)"), CurrentScreenshotIndex + 1, ManagedCameras.Num());
-		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
-
-		GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
-
-		// Create a timer to periodically check the path tracing progress.
-		FTimerDelegate ProgressCheckDelegate;
-		ProgressCheckDelegate.BindLambda([this]()
-		{
-			int32 CurrentSPP, TotalSPP;
-			const float Progress = GetPathTracingProgress(CurrentSPP, TotalSPP);
-			LogPathTracingProgress();
-
-			// When accumulation is complete, take the screenshot.
-			if (Progress >= 1.0f)
-			{
-				GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
-				
-				ENQUEUE_RENDER_COMMAND(FHighResScreenshotRenderCommand)(
-					[this](FRHICommandListImmediate& RHICmdList)
-					{
-						AsyncTask(ENamedThreads::GameThread, [this]()
-						{
-							if (!this || !GetWorld())
-							{
-								return; // Safety check
-							}
-
-							const FString SaveFilename = FString::Printf(
-								TEXT("%s_%03d"), *CameraNamePrefix, CurrentScreenshotIndex);
-
-							FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
-							if (IsHdrFormat())
-							{
-								HRConfig.bCaptureHDR = true;
-								const FString HdrFilename = SaveFilename + TEXT(".") + GetFileExtension();
-								HRConfig.FilenameOverride = FPaths::Combine(
-									FPaths::ProjectSavedDir(), OutputPath, HdrFilename);
-								HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
-								HRConfig.bDumpBufferVisualizationTargets = false;
-							}
-							else
-							{
-								HRConfig.bCaptureHDR = false;
-								const FString LDRFilename = SaveFilename + TEXT(".") + GetFileExtension();
-								HRConfig.FilenameOverride = FPaths::Combine(
-									FPaths::ProjectSavedDir(), OutputPath, LDRFilename);
-								HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
-								HRConfig.bDumpBufferVisualizationTargets = false;
-							}
-							
-							CurrentScreenshotIndex++;
-
-							// Schedule the next screenshot for the next tick.
-							FTimerDelegate NextScreenshotDel;
-							NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
-							GetWorld()->GetTimerManager().SetTimerForNextTick(NextScreenshotDel);
-						});
-					}
-				);
-			}
-		});
-
-		GetWorld()->GetTimerManager().SetTimer(ScreenshotTimerHandle, ProgressCheckDelegate, 0.1f, true);
-	}
-	else
-	{
-		GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
-		
-		const FString SaveFilename = FString::Printf(
-								TEXT("%s_%03d"), *CameraNamePrefix, CurrentScreenshotIndex);
-		FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
-		HRConfig.bCaptureHDR = false;
-		const FString LDRFilename = SaveFilename + TEXT(".") + GetFileExtension();
-		HRConfig.FilenameOverride = FPaths::Combine(
-			FPaths::ProjectSavedDir(), OutputPath, LDRFilename);
-		HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
-		HRConfig.bDumpBufferVisualizationTargets = false;
-
-		// 安排下一次截图
-		CurrentScreenshotIndex++;
-		FTimerDelegate NextScreenshotDel;
-		NextScreenshotDel.BindUObject(this, &ACameraArrayManager::TakeNextHighResScreenshot);
-		GetWorld()->GetTimerManager().SetTimer(ScreenshotTimerHandle, NextScreenshotDel, 0.1f, false);
-	}
+	});
 }
 
-void ACameraArrayManager::TakeFirstCameraScreenshot()
+// 核心函数：为单个相机执行截图，并在完成后调用OnComplete回调
+void ACameraArrayManager::ExecuteScreenshotForCamera(int32 CameraIndex, TFunction<void()> OnComplete)
 {
-	if (ManagedCameras.Num() > 0)
-	{
-		TakeSingleHighResScreenshot(0);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("TakeFirstCameraScreenshot: No managed cameras available to capture."));
-	}
-}
-
-void ACameraArrayManager::TakeLastCameraScreenshot()
-{
-	if (ManagedCameras.Num() > 0)
-	{
-		TakeSingleHighResScreenshot(ManagedCameras.Num() - 1);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("TakeLastCameraScreenshot: No managed cameras available to capture."));
-	}
-}
-
-void ACameraArrayManager::TakeSingleHighResScreenshot(int32 CameraIndex)
-{
-	if (bIsTaskRunning)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("TakeSingleHighResScreenshot: A task is already running."));
-		return;
-	}
 	if (!ManagedCameras.IsValidIndex(CameraIndex) || !IsValid(ManagedCameras[CameraIndex]))
 	{
-		UE_LOG(LogTemp, Error, TEXT("TakeSingleHighResScreenshot: Invalid camera index %d."), CameraIndex);
-		return;
-	}
-	if (!GEditor)
-	{
-		UE_LOG(LogTemp, Error, TEXT("TakeSingleHighResScreenshot: GEditor is not available."));
+		UE_LOG(LogTemp, Error, TEXT("ExecuteScreenshotForCamera: Invalid camera at index %d."), CameraIndex);
+		OnComplete(); // 即使失败也要调用回调，以继续循环
 		return;
 	}
 
-	ClearAllTimers();
-	SaveOriginalViewportState();
-	LockEditorProperties();
-	bIsTaskRunning = true;
-	RenderStatus = FString::Printf(TEXT("准备为相机 %d 截图..."), CameraIndex);
-	UE_LOG(LogTemp, Log, TEXT("Starting single high-resolution screenshot for camera index %d."), CameraIndex);
-
-	// --- Position the Viewport ---
 	AActor* CameraActor = ManagedCameras[CameraIndex];
 	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
-
+	
 	if (!ViewportClient)
 	{
-		UE_LOG(LogTemp, Error, TEXT("Could not get active editor viewport client. Aborting."));
-		UnlockEditorProperties();
-		RestoreOriginalViewportState();
-		bIsTaskRunning = false;
+		UE_LOG(LogTemp, Error, TEXT("ExecuteScreenshotForCamera: Could not get active editor viewport client."));
+		OnComplete();
 		return;
 	}
-	
+
+	// 1. 定位视口
 	const FTransform CameraTransform = CameraActor->GetActorTransform();
 	ViewportClient->SetViewLocation(CameraTransform.GetLocation());
 	ViewportClient->SetViewRotation(CameraTransform.GetRotation().Rotator());
@@ -1255,82 +1092,124 @@ void ACameraArrayManager::TakeSingleHighResScreenshot(int32 CameraIndex)
 	ViewportClient->ViewportType = LVT_Perspective;
 	ViewportClient->Invalidate();
 
-	// --- Configure and Take Screenshot ---
+	RenderStatus = FString::Printf(TEXT("处理中... (%d/%d)"), CameraIndex + 1, ManagedCameras.Num());
+	UE_LOG(LogTemp, Log, TEXT("Processing screenshot for camera index %d."), CameraIndex);
+
+	// 2. 配置并请求截图
 	const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
-	int32 SamplesPerPixel = 1;
-	if (PostProcessVolumeRef)
+	
+	// 定义截图完成后要执行的操作
+	auto RequestScreenshotAndContinue = [this, CameraIndex, OnComplete]()
 	{
-		SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("PostProcessVolumeRef is not set. Using default Samples Per Pixel."));
-	}
-
-	auto FinalizeScreenshot = [this, CameraIndex]()
-	{
-		// This lambda contains the logic to configure, take the shot, and clean up.
 		const FString SaveFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CameraIndex);
-
 		FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
+
 		if (IsHdrFormat())
 		{
 			HRConfig.bCaptureHDR = true;
-			const FString HdrFilename = SaveFilename + TEXT(".") + GetFileExtension();
-			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, HdrFilename);
+			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
 		}
 		else
 		{
 			HRConfig.bCaptureHDR = false;
-			const FString LDRFilename = SaveFilename + TEXT(".") + GetFileExtension();
-			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, LDRFilename);
+			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
 		}
 		HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
 		HRConfig.bDumpBufferVisualizationTargets = false;
-
-		// The screenshot is now configured. The actual capture will happen at the end of the frame.
-		// We can now set a timer to restore the state on the next frame to ensure the capture completes.
-		FTimerHandle RestoreTimerHandle;
-		FTimerDelegate RestoreDelegate;
-		RestoreDelegate.BindLambda([this]()
-		{
-			UE_LOG(LogTemp, Log, TEXT("Single screenshot process completed."));
-			RenderStatus = TEXT("完成");
-			UnlockEditorProperties();
-			RestoreOriginalViewportState();
-			bIsTaskRunning = false;
-			OpenOutputFolder();
-		});
-		GetWorld()->GetTimerManager().SetTimer(RestoreTimerHandle, RestoreDelegate, 0.1f, false);
+		
+		// 提交截图请求。引擎将在帧末尾处理它
+		GEditor->GetActiveViewport()->TakeHighResScreenShot();
+		
+		// 调用回调函数，以触发循环的下一步
+		OnComplete();
 	};
 
 	if (bIsPathTracing)
 	{
-		RenderStatus = FString::Printf(TEXT("路径追踪... (相机 %d)"), CameraIndex);
-		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
-		
-		// Set a timer to check for path tracing completion
-		FTimerDelegate ProgressCheckDelegate;
-		ProgressCheckDelegate.BindLambda([this, FinalizeScreenshot]()
+		int32 SamplesPerPixel = 1;
+		if (PostProcessVolumeRef)
 		{
-			int32 CurrentSPP, TotalSPP;
-			const float Progress = GetPathTracingProgress(CurrentSPP, TotalSPP);
-			LogPathTracingProgress();
+			SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
+		}
 
-			if (Progress >= 1.0f)
-			{
-				GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
-				FinalizeScreenshot();
-			}
+		// 关键命令：设置引擎内置的截图延迟（单位是帧）
+		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
+
+		// 我们不再需要手动检查进度，直接使用引擎的延迟机制。
+		// 但我们仍需要一个定时器来等待这个延迟结束。
+		// 延迟时间 = (采样数 / 帧率) + 一个小的缓冲时间
+		const float WaitTime = (SamplesPerPixel / 60.0f) + 0.5f; // 假设60fps，并增加0.5秒缓冲
+		
+		UE_LOG(LogTemp, Log, TEXT("Path Tracing: Waiting %.2f seconds for %d samples."), WaitTime, SamplesPerPixel);
+		
+		FTimerHandle PathTracingWaitTimer;
+		FTimerDelegate WaitDelegate;
+		WaitDelegate.BindLambda([RequestScreenshotAndContinue]()
+		{
+			// 延迟结束后，执行截图请求和下一步操作
+			RequestScreenshotAndContinue();
 		});
-		GetWorld()->GetTimerManager().SetTimer(ScreenshotTimerHandle, ProgressCheckDelegate, 0.1f, true);
+
+		GetWorld()->GetTimerManager().SetTimer(PathTracingWaitTimer, WaitDelegate, WaitTime, false);
 	}
-	else
+	else // Rasterization
 	{
-		RenderStatus = FString::Printf(TEXT("光栅化... (相机 %d)"), CameraIndex);
-		FinalizeScreenshot();
+		// 对于光栅化，不需要延迟
+		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(0);
+		RequestScreenshotAndContinue();
 	}
 }
+
+// 公共接口：为第一个相机截图
+void ACameraArrayManager::TakeFirstCameraScreenshot()
+{
+	if (bIsTaskRunning) return;
+	if (ManagedCameras.Num() > 0)
+	{
+		bIsTaskRunning = true;
+		LockEditorProperties();
+		SaveOriginalViewportState();
+		
+		ExecuteScreenshotForCamera(0, [this]()
+		{
+			FTimerHandle FinalizeTimerHandle;
+			// 等待片刻以确保文件写入
+			GetWorld()->GetTimerManager().SetTimer(FinalizeTimerHandle, FTimerDelegate::CreateLambda([this]()
+			{
+				UnlockEditorProperties();
+				RestoreOriginalViewportState();
+				bIsTaskRunning = false;
+				OpenOutputFolder();
+			}), 1.0f, false);
+		});
+	}
+}
+
+// 公共接口：为最后一个相机截图
+void ACameraArrayManager::TakeLastCameraScreenshot()
+{
+	if (bIsTaskRunning) return;
+	if (ManagedCameras.Num() > 0)
+	{
+		bIsTaskRunning = true;
+		LockEditorProperties();
+		SaveOriginalViewportState();
+		
+		ExecuteScreenshotForCamera(ManagedCameras.Num() - 1, [this]()
+		{
+			FTimerHandle FinalizeTimerHandle;
+			// 等待片刻以确保文件写入
+			GetWorld()->GetTimerManager().SetTimer(FinalizeTimerHandle, FTimerDelegate::CreateLambda([this]()
+			{
+				UnlockEditorProperties();
+				RestoreOriginalViewportState();
+				bIsTaskRunning = false;
+				OpenOutputFolder();
+			}), 1.0f, false);
+		});
+	}
+}
+
 
 float ACameraArrayManager::GetPathTracingProgress(int32& CurrentSPP, int32& TotalSPP)
 {

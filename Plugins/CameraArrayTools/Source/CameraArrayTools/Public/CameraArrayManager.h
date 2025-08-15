@@ -173,7 +173,7 @@ public:
 		meta = (DisplayName = "为所有相机拍摄高清截图", CallInEditorCondition = "!bIsRenderingLocked"))
 	void TakeHighResScreenshots();
 
-	// 为第一个相机渲染
+	 // 为第一个相机渲染
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "为第一个相机拍摄高清截图", CallInEditorCondition = "!bIsRenderingLocked"))
 	void TakeFirstCameraScreenshot();
 
@@ -234,6 +234,8 @@ private:
 	float GetPathTracingProgress(int32& CurrentSPP, int32& TotalSPP);
 	void LogPathTracingProgress();
 	void TakeSingleHighResScreenshot(int32 CameraIndex);
+	void ExecuteScreenshotForCamera(int32 CameraIndex, TFunction<void()> OnComplete);
+	void TakeNextHighResScreenshot_Recursive();
 	
 	// 添加清理定时器的函数
 	void ClearAllTimers();
