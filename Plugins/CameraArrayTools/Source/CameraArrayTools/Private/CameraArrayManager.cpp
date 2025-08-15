@@ -102,6 +102,7 @@ void ACameraArrayManager::SaveOriginalViewportState()
 		return;
 	}
 
+#if WITH_EDITOR
 	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
 	if (!ViewportClient)
 	{
@@ -119,6 +120,7 @@ void ACameraArrayManager::SaveOriginalViewportState()
 
 	UE_LOG(LogTemp, Log, TEXT("Saved original viewport state: Location(%s), Rotation(%s), FOV(%f)"),
 		*OriginalViewportState.Location.ToString(), *OriginalViewportState.Rotation.ToString(), OriginalViewportState.FOV);
+#endif
 }
 
 void ACameraArrayManager::RestoreOriginalViewportState()
@@ -134,7 +136,8 @@ void ACameraArrayManager::RestoreOriginalViewportState()
 		UE_LOG(LogTemp, Warning, TEXT("RestoreOriginalViewportState: GEditor is not available."));
 		return;
 	}
-
+	
+#if WITH_EDITOR
 	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
 	if (!ViewportClient)
 	{
@@ -151,6 +154,7 @@ void ACameraArrayManager::RestoreOriginalViewportState()
 	ViewportClient->Invalidate();
 
 	UE_LOG(LogTemp, Log, TEXT("Restored original viewport state."));
+#endif
 }
 
 void ACameraArrayManager::LockEditorProperties()
@@ -360,14 +364,15 @@ void ACameraArrayManager::InitializeCaptureComponents()
 
 void ACameraArrayManager::CreateOrUpdateCameras()
 {
+	if (bIsTaskRunning)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CreateOrUpdateCameras: 无法在渲染任务进行中刷新相机。"));
+		return;
+	}
 	// 在创建新相机前清理现有定时器
 #if WITH_EDITOR
 	ClearAllTimers();
 #endif
-	if (bIsTaskRunning)
-	{
-		return; // 渲染时禁止修改，防止冲突
-	}
 	
 	ClearAllCameras();
 
@@ -1016,19 +1021,27 @@ void ACameraArrayManager::TakeHighResScreenshots()
 
 void ACameraArrayManager::TakeNextHighResScreenshot()
 {
-	if (CurrentScreenshotIndex > ManagedCameras.Num())
+	if (CurrentScreenshotIndex >= ManagedCameras.Num())
 	{
-		UE_LOG(LogTemp, Log, TEXT("High-resolution screenshot process completed."));
 		GetWorld()->GetTimerManager().ClearTimer(ScreenshotTimerHandle);
-		RenderProgress = 100;
-		RenderStatus = TEXT("高清截图完成");
-		bIsTaskRunning = false;
 		
-		// 恢复原始视口状态
-		RestoreOriginalViewportState();
-		
-		// 解锁编辑器属性
-		UnlockEditorProperties();
+		FTimerHandle RestoreViewportTimerHandle;
+		FTimerDelegate RestoreDelegate;
+		RestoreDelegate.BindLambda([this]()
+		{
+			// 这个Lambda函数内的代码将在延时结束后执行
+			UE_LOG(LogTemp, Log, TEXT("Finalizing process and restoring original viewport state."));
+			RenderProgress = 100;
+			RenderStatus = TEXT("完成");
+			bIsTaskRunning = false;
+			
+			RestoreOriginalViewportState();
+			UnlockEditorProperties();
+			OpenOutputFolder();
+		});
+
+		// 设置延时确保截图完成
+		GetWorld()->GetTimerManager().SetTimer(RestoreViewportTimerHandle, RestoreDelegate, 3.0f, false);
 		
 		return;
 	}
@@ -1045,6 +1058,7 @@ void ACameraArrayManager::TakeNextHighResScreenshot()
 		return;
 	}
 
+#if WITH_EDITOR
 	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->
 		GetClient());
 	if (!ViewportClient)
@@ -1067,6 +1081,7 @@ void ACameraArrayManager::TakeNextHighResScreenshot()
 	ViewportClient->Invalidate();
 
 	const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
+#endif
 	int32 SamplesPerPixel = 1;
 	if (PostProcessVolumeRef)
 	{
@@ -1218,7 +1233,7 @@ void ACameraArrayManager::TakeSingleHighResScreenshot(int32 CameraIndex)
 	RenderStatus = FString::Printf(TEXT("准备为相机 %d 截图..."), CameraIndex);
 	UE_LOG(LogTemp, Log, TEXT("Starting single high-resolution screenshot for camera index %d."), CameraIndex);
 
-	// --- 2. Position the Viewport ---
+	// --- Position the Viewport ---
 	AActor* CameraActor = ManagedCameras[CameraIndex];
 	FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(GEditor->GetActiveViewport()->GetClient());
 
@@ -1242,6 +1257,15 @@ void ACameraArrayManager::TakeSingleHighResScreenshot(int32 CameraIndex)
 
 	// --- Configure and Take Screenshot ---
 	const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
+	int32 SamplesPerPixel = 1;
+	if (PostProcessVolumeRef)
+	{
+		SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PostProcessVolumeRef is not set. Using default Samples Per Pixel."));
+	}
 
 	auto FinalizeScreenshot = [this, CameraIndex]()
 	{
@@ -1283,6 +1307,7 @@ void ACameraArrayManager::TakeSingleHighResScreenshot(int32 CameraIndex)
 	if (bIsPathTracing)
 	{
 		RenderStatus = FString::Printf(TEXT("路径追踪... (相机 %d)"), CameraIndex);
+		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
 		
 		// Set a timer to check for path tracing completion
 		FTimerDelegate ProgressCheckDelegate;

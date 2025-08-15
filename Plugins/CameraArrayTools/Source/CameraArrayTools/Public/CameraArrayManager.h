@@ -5,8 +5,12 @@
 #include "Math/Vector.h"
 #include "Math/Rotator.h"
 #include "Engine/EngineTypes.h"
-#include "CameraArrayManager.generated.h"
 
+#if WITH_EDITOR
+#include "Editor/UnrealEdTypes.h"
+#endif
+
+#include "CameraArrayManager.generated.h"
 
 class USceneCaptureComponent2D; // Forward declaration
 class UTextureRenderTarget2D;
@@ -45,7 +49,8 @@ protected:
 
 public:
 	virtual void Tick(float DeltaTime) override;
-
+	
+#if WITH_EDITOR
 	// 添加保存视口原始状态的结构体
 	struct FViewportState
 	{
@@ -60,7 +65,8 @@ public:
 		FViewportState() : Location(FVector::ZeroVector), Rotation(FRotator::ZeroRotator), FOV(90.0f), 
 			bIsRealtime(false), bIsInGameView(false), ViewportType(LVT_Perspective), bIsValid(false) {}
 	};
-
+#endif
+	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings",
 		meta = (DisplayName = "相机数量", UIMin = "1", UIMax = "99", Delta = "1", EditCondition = "!bIsRenderingLocked"))
 	int32 NumCameras = 80;
@@ -137,32 +143,25 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "[READONLY]", meta = (DisplayName = "正在渲染"))
 	bool bIsRenderingLocked = false;
 
-
+	// 创建或更新相机
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", 
 		meta = (DisplayName = "创建或更新相机", CallInEditorCondition = "!bIsRenderingLocked"))
 	void CreateOrUpdateCameras();
 
+	// 清除所有相机
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", 
 		meta = (DisplayName = "清除相机", CallInEditorCondition = "!bIsRenderingLocked"))
 	void ClearAllCameras();
 
+	//选择第一个相机
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", 
 		meta = (DisplayName = "选择第一个相机", CallInEditorCondition = "!bIsRenderingLocked"))
 	void SelectFirstCamera();
 
+	// 选择最后一个相机
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", 
 		meta = (DisplayName = "选择最后一个相机", CallInEditorCondition = "!bIsRenderingLocked"))
 	void SelectLastCamera();
-
-	/*UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染第一个相机"))
-	void RenderFirstCamera();
-
-	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染最后一个相机"))
-	void RenderLastCamera();
-
-	UFUNCTION(BlueprintCallable,CallInEditor, Category = "批处理", meta = (DisplayName = "渲染到图片"))
-	void RenderAllViews();*/
-	
 	
 	// 打开输出文件夹
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "批处理", 
@@ -182,6 +181,15 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "为最后一个相机拍摄高清截图", CallInEditorCondition = "!bIsRenderingLocked"))
 	void TakeLastCameraScreenshot();
 
+	/*UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染第一个相机"))
+	void RenderFirstCamera();
+
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染最后一个相机"))
+	void RenderLastCamera();
+
+	UFUNCTION(BlueprintCallable,CallInEditor, Category = "批处理", meta = (DisplayName = "渲染到图片"))
+	void RenderAllViews();*/
+	
 private:
 	UPROPERTY()
 	TArray<TObjectPtr<AActor>> ManagedCameras;
@@ -194,9 +202,6 @@ private:
 
 	UPROPERTY()
 	TObjectPtr<UTextureRenderTarget2D> ReusableHdrRenderTarget; // HDR
-
-	// 添加保存视口原始状态的变量
-	FViewportState OriginalViewportState;
 
 	void InitializeCaptureComponents();
 
@@ -220,6 +225,9 @@ private:
 	FTimerHandle PathTracingLogTimerHandle;
 
 #if WITH_EDITOR
+	// 添加保存视口原始状态的变量
+	FViewportState OriginalViewportState;
+	
 	void SyncShowFlagsWithEditorViewport();
 	void SyncPostProcessSettings();
 	void TakeNextHighResScreenshot();
