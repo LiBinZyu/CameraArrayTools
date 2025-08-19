@@ -26,6 +26,8 @@
 #include "SceneView.h"
 #include "SceneManagement.h"
 #include "HighResScreenshot.h"
+#include "LevelEditorViewport.h"
+#include "EditorViewportClient.h"
 #endif
 
 ACameraArrayManager::ACameraArrayManager()
@@ -1098,65 +1100,88 @@ void ACameraArrayManager::ExecuteScreenshotForCamera(int32 CameraIndex, TFunctio
 	// 2. 配置并请求截图
 	const bool bIsPathTracing = ViewportClient->EngineShowFlags.PathTracing;
 	
-	// 定义截图完成后要执行的操作
-	auto RequestScreenshotAndContinue = [this, CameraIndex, OnComplete]()
 	{
-		const FString SaveFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CameraIndex);
-		FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
-
-		if (IsHdrFormat())
+		int32 FramesDelay = 1;
+		if (bIsPathTracing)
 		{
-			HRConfig.bCaptureHDR = true;
-			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
+			int32 SamplesPerPixel = 1;
+			if (PostProcessVolumeRef)
+			{
+				SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
+			}
+			FramesDelay = FMath::Max(SamplesPerPixel, 1);
+			UE_LOG(LogTemp, Log, TEXT("Path Tracing: Requesting screenshot now; delaying capture by %d frames."), FramesDelay);
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(FramesDelay);
 		}
 		else
 		{
-			HRConfig.bCaptureHDR = false;
-			HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
-		}
-		HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
-		HRConfig.bDumpBufferVisualizationTargets = false;
-		
-		// 提交截图请求。引擎将在帧末尾处理它
-		GEditor->GetActiveViewport()->TakeHighResScreenShot();
-		
-		// 调用回调函数，以触发循环的下一步
-		OnComplete();
-	};
-
-	if (bIsPathTracing)
-	{
-		int32 SamplesPerPixel = 1;
-		if (PostProcessVolumeRef)
-		{
-			SamplesPerPixel = PostProcessVolumeRef->Settings.PathTracingSamplesPerPixel;
+			FramesDelay = FMath::Max(SPPLit, 1);
+			UE_LOG(LogTemp, Log, TEXT("Rasterization: Requesting screenshot now; delaying capture by %d frames."), FramesDelay);
+			IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(FramesDelay);
 		}
 
-		// 关键命令：设置引擎内置的截图延迟（单位是帧）
-		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(SamplesPerPixel);
-
-		// 我们不再需要手动检查进度，直接使用引擎的延迟机制。
-		// 但我们仍需要一个定时器来等待这个延迟结束。
-		// 延迟时间 = (采样数 / 帧率) + 一个小的缓冲时间
-		const float WaitTime = (SamplesPerPixel / 60.0f) + 0.5f; // 假设60fps，并增加0.5秒缓冲
-		
-		UE_LOG(LogTemp, Log, TEXT("Path Tracing: Waiting %.2f seconds for %d samples."), WaitTime, SamplesPerPixel);
-		
-		FTimerHandle PathTracingWaitTimer;
-		FTimerDelegate WaitDelegate;
-		WaitDelegate.BindLambda([RequestScreenshotAndContinue]()
+		// 立即配置并请求截图
 		{
-			// 延迟结束后，执行截图请求和下一步操作
-			RequestScreenshotAndContinue();
+			const FString SaveFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CameraIndex);
+			const FString FullFilePath = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
+			FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
+			if (IsHdrFormat())
+			{
+				HRConfig.bCaptureHDR = true;
+				HRConfig.FilenameOverride = FullFilePath;
+			}
+			else
+			{
+				HRConfig.bCaptureHDR = false;
+				HRConfig.FilenameOverride = FullFilePath;
+			}
+
+			// 检查文件是否存在且不覆盖的情况
+			if (!bOverwriteExisting && FPlatformFileManager::Get().GetPlatformFile().FileExists(*FullFilePath))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("文件已存在，跳过保存: %s"), *FullFilePath);
+				
+				// 如果是单个相机截图，直接调用OnComplete
+				if (CameraIndex >= 0)
+				{
+					if (OnComplete)
+					{
+						OnComplete();
+					}
+					return;
+				}
+				// 如果是批量截图，继续处理下一个相机
+				else
+				{
+					TakeNextHighResScreenshot_Recursive();
+					return;
+				}
+			}
+
+			HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
+			HRConfig.bDumpBufferVisualizationTargets = false;
+			//GEditor->GetActiveViewport()->TakeHighResScreenShot();
+		}
+
+		// 仅延迟推进到下一个相机：按帧数估算时间（假设60fps），保持与截图延迟对齐
+		const float AdvanceDelaySeconds = (static_cast<float>(FramesDelay) / 60.0f) + 0.05f;
+		FTimerDelegate AdvanceDelegate;
+		AdvanceDelegate.BindLambda([this, OnComplete]()
+		{
+			// 若已强制停止，则不再推进
+			if (!bIsTaskRunning)
+			{
+				return;
+			}
+			OnComplete();
 		});
-
-		GetWorld()->GetTimerManager().SetTimer(PathTracingWaitTimer, WaitDelegate, WaitTime, false);
-	}
-	else // Rasterization
-	{
-		// 对于光栅化，不需要延迟
-		IConsoleManager::Get().FindConsoleVariable(TEXT("r.HighResScreenshotDelay"))->Set(0);
-		RequestScreenshotAndContinue();
+		// 复用 PathTracingLogTimerHandle 作为推进句柄
+		FTimerManager& TM = GetWorld()->GetTimerManager();
+		if (TM.IsTimerActive(PathTracingLogTimerHandle))
+		{
+			TM.ClearTimer(PathTracingLogTimerHandle);
+		}
+		TM.SetTimer(PathTracingLogTimerHandle, AdvanceDelegate, AdvanceDelaySeconds, false);
 	}
 }
 
@@ -1208,6 +1233,36 @@ void ACameraArrayManager::TakeLastCameraScreenshot()
 			}), 1.0f, false);
 		});
 	}
+}
+
+void ACameraArrayManager::ForceStopAllTasks()
+{
+	if (!bIsTaskRunning)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ForceStopAllTasks: 没有正在运行的截图任务。"));
+		return;
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("ForceStopAllTasks: 正在强行终止所有截图任务..."));
+	
+	// 清理所有定时器
+#if WITH_EDITOR
+	ClearAllTimers();
+#endif
+	
+	// 重置任务状态
+	bIsTaskRunning = false;
+	CurrentScreenshotIndex = 0;
+	RenderProgress = 0;
+	RenderStatus = TEXT("已强行终止");
+	
+	// 恢复编辑器属性编辑权限
+	UnlockEditorProperties();
+	
+	// 恢复原始视口状态
+	RestoreOriginalViewportState();
+	
+	UE_LOG(LogTemp, Log, TEXT("ForceStopAllTasks: 所有任务已成功终止。"));
 }
 
 
@@ -1289,6 +1344,70 @@ void ACameraArrayManager::LogPathTracingProgress()
 	{
 		UE_LOG(LogTemp, Log, TEXT("路径追踪累积进度: %d / %d 采样 (%.1f%%)"), CurrentSPP, TotalSPP, Progress * 100.0f);
 	}
+}
+
+void ACameraArrayManager::OnPathTracingProgressCheck(int32 CameraIndex, int32 SamplesPerPixel, TFunction<void()> OnComplete)
+{
+	// 检查对象有效性
+	if (!IsValid(this) || !GetWorld())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Path Tracing: Object or World is no longer valid, stopping progress check."));
+		return;
+	}
+
+	int32 CurrentSPP, TotalSPP;
+	const float Progress = GetPathTracingProgress(CurrentSPP, TotalSPP);
+	
+	// 如果进度达到1.0（100%），或者当前SPP达到目标SPP，则执行截图
+	if (Progress >= 1.0f || CurrentSPP >= SamplesPerPixel)
+	{
+		UE_LOG(LogTemp, Log, TEXT("Path Tracing: Progress reached %.1f%% (%d/%d samples), taking screenshot."), 
+			Progress * 100.0f, CurrentSPP, TotalSPP);
+		
+		// 清除定时器
+		GetWorld()->GetTimerManager().ClearTimer(PathTracingLogTimerHandle);
+		
+		// 执行截图请求和下一步操作
+		TakeScreenshotAndContinue(CameraIndex, OnComplete);
+	}
+	else
+	{
+		// 继续等待，每0.1秒检查一次进度
+		UE_LOG(LogTemp, Log, TEXT("Path Tracing: Progress %.1f%% (%d/%d samples), continuing to wait..."), 
+			Progress * 100.0f, CurrentSPP, TotalSPP);
+	}
+}
+
+void ACameraArrayManager::TakeScreenshotAndContinue(int32 CameraIndex, TFunction<void()> OnComplete)
+{
+	// 检查对象有效性
+	if (!IsValid(this) || !GetWorld())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("TakeScreenshotAndContinue: Object or World is no longer valid."));
+		return;
+	}
+
+	const FString SaveFilename = FString::Printf(TEXT("%s_%03d"), *CameraNamePrefix, CameraIndex);
+	FHighResScreenshotConfig& HRConfig = GetHighResScreenshotConfig();
+
+	if (IsHdrFormat())
+	{
+		HRConfig.bCaptureHDR = true;
+		HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
+	}
+	else
+	{
+		HRConfig.bCaptureHDR = false;
+		HRConfig.FilenameOverride = FPaths::Combine(FPaths::ProjectSavedDir(), OutputPath, SaveFilename + TEXT(".") + GetFileExtension());
+	}
+	HRConfig.SetResolution(RenderTargetX, RenderTargetY, 1.0f);
+	HRConfig.bDumpBufferVisualizationTargets = false;
+	
+	// 提交截图请求。引擎将在帧末尾处理它
+	//GEditor->GetActiveViewport()->TakeHighResScreenShot();
+	
+	// 调用回调函数，以触发循环的下一步
+	OnComplete();
 }
 
 #endif

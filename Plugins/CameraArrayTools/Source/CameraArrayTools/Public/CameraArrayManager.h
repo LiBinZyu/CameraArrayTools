@@ -128,6 +128,10 @@ public:
 		meta = (DisplayName = "相机前缀", EditCondition = "!bIsRenderingLocked"))
 	FString CameraNamePrefix = TEXT("Camera");
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings", 
+			meta = (DisplayName = "截图前采样数", EditCondition = "!bIsRenderingLocked"))
+	int32 SPPLit = 16;
+
 	/*UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Array Settings",
 		meta = (DisplayName = "路径追踪渲染时间 (秒)", EditCondition = "!bIsRenderingLocked"))
 	float PathTracingRenderTime = 3.0f;*/
@@ -180,6 +184,10 @@ public:
 	// 为最后一个相机渲染
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "为最后一个相机拍摄高清截图", CallInEditorCondition = "!bIsRenderingLocked"))
 	void TakeLastCameraScreenshot();
+	
+	// 强行终止所有截图任务
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "[READONLY]", meta = (DisplayName = "强行终止所有截图任务"))
+	void ForceStopAllTasks();
 
 	/*UFUNCTION(BlueprintCallable, CallInEditor, Category = "执行函数", meta = (DisplayName = "渲染第一个相机"))
 	void RenderFirstCamera();
@@ -247,5 +255,10 @@ private:
 	// 禁用和启用编辑器属性编辑的函数
 	void LockEditorProperties();
 	void UnlockEditorProperties();
+	
+	// 路径追踪进度检查和截图执行的函数
+	void OnPathTracingProgressCheck(int32 CameraIndex, int32 SamplesPerPixel, TFunction<void()> OnComplete);
+	void TakeScreenshotAndContinue(int32 CameraIndex, TFunction<void()> OnComplete);
+
 #endif
 };
